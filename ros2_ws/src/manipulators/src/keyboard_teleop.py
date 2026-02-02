@@ -11,6 +11,9 @@ Keys:
   J/L  - yaw +/-
   U/O  - roll +/-
   G    - toggle gripper open/close
+  M    - toggle mode (accumulated / relative-to-EE)
+  +/=  - increase delta scale (x2)
+  -    - decrease delta scale (x0.5)
   ESC  - quit
 """
 
@@ -38,6 +41,9 @@ Keyboard Teleop — Kinova Gen3
   J/L : yaw +/-
   U/O : roll +/-
   G   : toggle gripper
+  M   : toggle mode (accumulated / relative)
+  +/= : increase delta scale (x2)
+  -   : decrease delta scale (x0.5)
   ESC : quit
 ──────────────────────────────
 """
@@ -91,10 +97,14 @@ class KeyboardTeleopNode(Node):
         self.declare_parameter('linear_step', 0.005)
         self.declare_parameter('angular_step', 0.05)
         self.declare_parameter('publish_rate', 30.0)
+        self.declare_parameter('linear_threshold', 0.001)
+        self.declare_parameter('angular_threshold', 0.01)
 
         self.linear_step = self.get_parameter('linear_step').value
         self.angular_step = self.get_parameter('angular_step').value
         self.publish_rate = self.get_parameter('publish_rate').value
+        self.linear_threshold = self.get_parameter('linear_threshold').value
+        self.angular_threshold = self.get_parameter('angular_threshold').value
 
         self.pose_pub = self.create_publisher(PoseStamped, 'target_pose', 1)
         self.gripper_pub = self.create_publisher(Float64, 'gripper_command', 1)
@@ -103,25 +113,34 @@ class KeyboardTeleopNode(Node):
         self._target_pos = None
         self._target_rot = None
         self._gripper_open = True
+        self._relative_mode = False  # False = accumulated, True = relative-to-EE
+        self._scale = 1.0
+
+        # Live EE pose (continuously updated)
+        self._ee_pos = None
+        self._ee_rot = None
 
         self.create_subscription(PoseStamped, 'ee_pose', self._on_ee_pose, 1)
 
     def _on_ee_pose(self, msg: PoseStamped):
-        """Capture initial EE pose (only used once to initialize target)."""
-        if self._target_pos is not None:
-            return
-        self._target_pos = np.array([
+        """Capture EE pose. Initializes target on first call, then keeps tracking live EE."""
+        pos = np.array([
             msg.pose.position.x,
             msg.pose.position.y,
             msg.pose.position.z,
         ])
-        self._target_rot = quat_to_matrix(np.array([
+        rot = quat_to_matrix(np.array([
             msg.pose.orientation.x,
             msg.pose.orientation.y,
             msg.pose.orientation.z,
             msg.pose.orientation.w,
         ]))
-        self.get_logger().info("Got initial EE pose. Keyboard active.")
+        self._ee_pos = pos
+        self._ee_rot = rot
+        if self._target_pos is None:
+            self._target_pos = pos.copy()
+            self._target_rot = rot.copy()
+            self.get_logger().info("Got initial EE pose. Keyboard active.")
 
     def run(self):
         """Main loop: read keys, update target, publish."""
@@ -152,31 +171,69 @@ class KeyboardTeleopNode(Node):
                 self.get_logger().info(f"Gripper: {status}")
                 continue
 
+            if key and key.lower() == 'm':
+                self._relative_mode = not self._relative_mode
+                mode = "RELATIVE (EE + delta)" if self._relative_mode else "ACCUMULATED"
+                if not self._relative_mode:
+                    # Switching back to accumulated: re-seed target from current EE
+                    self._target_pos = self._ee_pos.copy()
+                    self._target_rot = self._ee_rot.copy()
+                self.get_logger().info(f"Mode: {mode}")
+                continue
+
+            if key and key in ('+', '='):
+                self._scale *= 2.0
+                self.get_logger().info(f"Scale: {self._scale:.4f}")
+                continue
+
+            if key and key == '-':
+                self._scale *= 0.5
+                self.get_logger().info(f"Scale: {self._scale:.4f}")
+                continue
+
+            moved = False
             if key and key.lower() in KEY_MAP:
                 axis, sign = KEY_MAP[key.lower()]
-                if axis < 3:
-                    # Position increment
-                    delta = np.zeros(3)
-                    delta[axis] = sign * self.linear_step
-                    self._target_pos += delta
-                else:
-                    # Rotation increment
-                    rot_axis = axis - 3
-                    dR = _rotation_matrix(rot_axis, sign * self.angular_step)
-                    self._target_rot = dR @ self._target_rot
+                eff_linear = self.linear_step * self._scale
+                eff_angular = self.angular_step * self._scale
 
-            # Always publish current target (even if no key pressed)
-            self._publish_target()
+                if self._relative_mode:
+                    self._target_pos = self._ee_pos.copy()
+                    self._target_rot = self._ee_rot.copy()
+
+                if axis < 3:
+                    if not self._relative_mode or eff_linear >= self.linear_threshold:
+                        delta = np.zeros(3)
+                        delta[axis] = sign * eff_linear
+                        self._target_pos += delta
+                        moved = True
+                else:
+                    if not self._relative_mode or eff_angular >= self.angular_threshold:
+                        rot_axis = axis - 3
+                        dR = _rotation_matrix(rot_axis, sign * eff_angular)
+                        self._target_rot = dR @ self._target_rot
+                        moved = True
+
+            # Publish target
+            if self._relative_mode:
+                if moved:
+                    self._publish_target()
+                # No key / below threshold: don't publish, let controller hold last target
+            else:
+                self._publish_target()
 
     def _publish_target(self):
-        quat = matrix_to_quat(self._target_rot)
+        self._publish_target_from(self._target_pos, self._target_rot)
+
+    def _publish_target_from(self, pos, rot):
+        quat = matrix_to_quat(rot)
 
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "world"
-        msg.pose.position.x = float(self._target_pos[0])
-        msg.pose.position.y = float(self._target_pos[1])
-        msg.pose.position.z = float(self._target_pos[2])
+        msg.pose.position.x = float(pos[0])
+        msg.pose.position.y = float(pos[1])
+        msg.pose.position.z = float(pos[2])
         msg.pose.orientation.x = float(quat[0])
         msg.pose.orientation.y = float(quat[1])
         msg.pose.orientation.z = float(quat[2])
