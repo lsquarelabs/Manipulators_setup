@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """Gravity-only residual identification.
 
-Loads static pose data, builds the gravity regressor via Pinocchio,
+Loads static pose data (YAML), builds the gravity regressor via Pinocchio,
 solves regularized LS for parameter corrections delta_pi.
 
 No ROS required.
 
 Usage:
-    python identify_gravity.py gravity_data.npz \
+    python identify_gravity.py --data gravity_data.yaml \
         --urdf ../assets/robots/kinova/urdf/gen3_2f85.urdf
 """
 
+import os
 import argparse
 import numpy as np
+import yaml
 import pinocchio as pin
+
+DEFAULT_URDF = os.path.join(
+    os.path.dirname(__file__), os.pardir, os.pardir,
+    "assets", "robots", "kinova", "urdf", "gen3_2f85.urdf",
+)
 
 ARM_JOINT_NAMES = [f"gen3_joint_{i}" for i in range(1, 8)]
 PARAMS_PER_BODY = 10
@@ -30,6 +37,23 @@ def load_model(urdf_path):
         v_idx.append(joint.idx_v)
         q_info.append((joint.idx_q, joint.nq))
     return model, data, np.array(v_idx, dtype=np.intp), q_info
+
+
+def load_data(yaml_path):
+    """Load gravity data YAML, return q_rad (N,7) and tau (N,7)."""
+    with open(yaml_path, "r") as f:
+        raw = yaml.safe_load(f)
+    poses = raw["poses"]
+
+    q_deg = np.array([p["q"]["mean"] for p in poses])
+    tau = np.array([p["tau"]["mean"] for p in poses])
+
+    # Convert Kinova 0-360 degrees to signed radians
+    q_signed = q_deg.copy()
+    q_signed[q_signed > 180.0] -= 360.0
+    q_rad = np.deg2rad(q_signed)
+
+    return q_rad, tau
 
 
 def set_arm_q(q_full, q_arm, q_info):
@@ -123,17 +147,17 @@ def apply_corrections(model, delta_pi):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("data", help=".npz from collect_static_poses.py")
-    parser.add_argument("--urdf", required=True)
+    parser.add_argument("--data", default="gravity_data.yaml",
+                        help=".yaml from collect_static_poses.py")
+    parser.add_argument("--urdf", default=DEFAULT_URDF)
     parser.add_argument("--lambda-reg", type=float, default=1.0)
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output", default="gravity_corrections.npz")
+    parser.add_argument("--output", default="gravity_corrections.yaml")
     args = parser.parse_args()
 
     # Load data
-    d = np.load(args.data)
-    q_all, tau_all = d["q_rad"], d["tau"]
+    q_all, tau_all = load_data(args.data)
     N = len(q_all)
     print(f"Loaded {N} samples")
 
@@ -177,8 +201,20 @@ def main():
     print_corrections(model, delta_pi)
 
     # Save
-    np.savez(args.output, delta_pi=delta_pi, active=active,
-             lambda_reg=np.array(args.lambda_reg))
+    output = {
+        "lambda_reg": args.lambda_reg,
+        "n_active_params": int(active.sum()),
+        "delta_pi": delta_pi.tolist(),
+        "active": active.tolist(),
+        "rmse_train_before": float(rb_t),
+        "rmse_train_after": float(ra_t),
+        "rmse_val_before": float(rb_v),
+        "rmse_val_after": float(ra_v),
+        "per_joint_rmse_val_before": pjb_v.tolist(),
+        "per_joint_rmse_val_after": pja_v.tolist(),
+    }
+    with open(args.output, "w") as f:
+        yaml.dump(output, f, default_flow_style=None, sort_keys=False)
     print(f"\nSaved corrections to {args.output}")
 
 
