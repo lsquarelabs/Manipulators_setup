@@ -23,7 +23,11 @@
       "Bash(apt-cache search:*)",
       "Bash(apt-cache:*)",
       "Bash(sudo apt update:*)",
-      "Bash(pip uninstall:*)"
+      "Bash(pip uninstall:*)",
+      "Bash(xargs:*)",
+      "Bash(wc:*)",
+      "Bash(conda list:*)",
+      "Bash(ls:*)"
     ],
     "deny": [],
     "ask": []
