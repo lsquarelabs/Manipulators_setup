@@ -2,8 +2,11 @@
 """Generate collision-free joint configurations for gravity sysid.
 
 Loads the Kinova Gen3 MuJoCo model with a table, generates candidate
-configurations, simulates the full motion path from home to each target,
-and keeps only poses reachable without any collision (table or self).
+configurations via Latin Hypercube Sampling, then builds a sequential
+chain using nearest-neighbor ordering: from the current pose, pick the
+closest untested candidate, simulate the direct transition, and accept
+if collision-free. The output sequence can be executed on the real robot
+without returning to home between poses.
 
 No ROS required.
 
@@ -39,7 +42,7 @@ SCENE_TEMPLATE = """\
 <mujoco model="sysid_scene">
   <include file="{gen3_file}"/>
   <visual>
-    <global offwidth="1920" offheight="1080"/>
+    <global offwidth="800" offheight="600"/>
   </visual>
   <worldbody>
 {lighting}
@@ -111,12 +114,19 @@ def latin_hypercube(n, rng):
     return configs
 
 
-def is_pose_valid(model, data, target_rad, home_key_id,
-                  max_steps=3000, tol=0.02, viewer=None):
-    """Simulate home → target. Returns True if no collision and converged.
-    Exits early once converged (no need to keep simulating)."""
+def set_arm_state(model, data, q_rad):
+    """Set the arm to a specific joint configuration (position, zero velocity)."""
+    data.qpos[:7] = q_rad
+    data.qvel[:7] = 0.0
+    mujoco.mj_forward(model, data)
+
+
+def simulate_transition(model, data, start_rad, target_rad,
+                        max_steps=3000, tol=0.02, viewer=None):
+    """Simulate start → target. Returns True if no collision and converged."""
     saved_mocap = data.mocap_pos.copy() if model.nmocap > 0 else None
-    mujoco.mj_resetDataKeyframe(model, data, home_key_id)
+    data.time = 0.0
+    set_arm_state(model, data, start_rad)
     if saved_mocap is not None:
         data.mocap_pos[:] = saved_mocap
     data.ctrl[:7] = target_rad
@@ -127,13 +137,49 @@ def is_pose_valid(model, data, target_rad, home_key_id,
             viewer.sync()
         if data.ncon > 0:
             return False
-        # Early exit once converged and velocity is low
         if (np.max(np.abs(data.qpos[:7] - target_rad)) < tol
                 and np.max(np.abs(data.qvel[:7])) < 0.05):
             return True
 
-    # Timed out — check if it at least converged
     return np.max(np.abs(data.qpos[:7] - target_rad)) < tol
+
+
+def joint_distance(a, b):
+    """Max absolute joint difference (Chebyshev distance)."""
+    return np.max(np.abs(a - b))
+
+
+def add_line(viewer, pos1, pos2, rgba):
+    """Add a line segment to the viewer scene between two 3D positions."""
+    if viewer is None:
+        return
+    scn = viewer.user_scn
+    if scn.ngeom >= scn.maxgeom:
+        return
+    mujoco.mjv_connector(
+        scn.geoms[scn.ngeom],
+        mujoco.mjtGeom.mjGEOM_LINE,
+        3.0,  # width in pixels
+        np.asarray(pos1, dtype=np.float64),
+        np.asarray(pos2, dtype=np.float64),
+    )
+    scn.geoms[scn.ngeom].rgba[:] = rgba
+    scn.ngeom += 1
+
+
+def get_ee_pos(model, data, q_rad):
+    """Forward kinematics to get end-effector position for a configuration."""
+    saved_q = data.qpos[:7].copy()
+    saved_v = data.qvel[:7].copy()
+    data.qpos[:7] = q_rad
+    data.qvel[:7] = 0.0
+    mujoco.mj_forward(model, data)
+    ee_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "end_effector_link")
+    pos = data.xpos[ee_id].copy()
+    data.qpos[:7] = saved_q
+    data.qvel[:7] = saved_v
+    mujoco.mj_forward(model, data)
+    return pos
 
 
 def main():
@@ -157,44 +203,96 @@ def main():
     model = load_scene(args.xml, n_green=n_green, n_red=n_red, light=args.light)
     data = mujoco.MjData(model)
 
-    home_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
-    if home_id < 0:
-        raise RuntimeError("'home' keyframe not found")
-
     ee_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
                                     "end_effector_link")
 
     candidates = latin_hypercube(args.n_candidates, rng)
+    available = np.ones(args.n_candidates, dtype=bool)  # mask of unused candidates
 
     viewer = None
     if args.visualize:
         viewer = mujoco.viewer.launch_passive(model, data)
 
     valid = []
+    via_home = []  # True if this pose required a home detour
     n_fail = 0
     checked = 0
-    print(f"Checking {args.n_candidates} candidates for {args.n_poses} valid ...")
+    zero_pos = np.zeros(7)
+    current_pos = zero_pos.copy()
+    # EE positions for line drawing
+    prev_ee = get_ee_pos(model, data, current_pos) if viewer else None
+    zero_ee = prev_ee  # cache zero-pose EE position
+
+    GREEN = np.array([0, 255, 0, 180], dtype=np.uint8)
+    YELLOW = np.array([255, 255, 0, 180], dtype=np.uint8)
+
+    print(f"Building chain from {args.n_candidates} candidates for {args.n_poses} valid ...")
 
     try:
-        for i, target in enumerate(candidates):
-            if len(valid) >= args.n_poses:
-                break
+        while len(valid) < args.n_poses and np.any(available):
             if viewer is not None and not viewer.is_running():
                 print("Viewer closed, stopping.")
                 break
-            checked += 1
-            if is_pose_valid(model, data, target, home_id, viewer=viewer):
-                if viewer is not None:
-                    data.mocap_pos[len(valid)] = data.xpos[ee_body_id].copy()
-                    viewer.sync()
-                valid.append(target)
-                print(f"  [{len(valid):3d}/{args.n_poses}] candidate {i+1:4d} OK  "
-                      f"[{', '.join(f'{a:+.2f}' for a in target)}]")
-            else:
-                if viewer is not None:
+
+            # Find nearest available candidate to current position
+            dists = np.full(args.n_candidates, np.inf)
+            avail_idx = np.where(available)[0]
+            for idx in avail_idx:
+                dists[idx] = joint_distance(current_pos, candidates[idx])
+            order = np.argsort(dists)
+
+            advanced = False
+            for idx in order:
+                if not available[idx]:
+                    continue
+                target = candidates[idx]
+                available[idx] = False
+                checked += 1
+
+                # Try direct: current → target
+                if simulate_transition(model, data, current_pos, target,
+                                       viewer=viewer):
+                    ee = data.xpos[ee_body_id].copy()
+                    if viewer is not None:
+                        data.mocap_pos[len(valid)] = ee
+                        add_line(viewer, prev_ee, ee, GREEN)
+                        viewer.sync()
+                    d = joint_distance(current_pos, target)
+                    valid.append(target)
+                    via_home.append(False)
+                    current_pos = target.copy()
+                    prev_ee = ee
+                    print(f"  [{len(valid):3d}/{args.n_poses}] candidate {idx+1:4d} OK  "
+                          f"dist={d:.2f}  "
+                          f"[{', '.join(f'{a:+.2f}' for a in target)}]")
+                    advanced = True
+                    break
+
+                # Try via home: zero → target
+                if simulate_transition(model, data, zero_pos, target,
+                                       viewer=viewer):
+                    ee = data.xpos[ee_body_id].copy()
+                    if viewer is not None:
+                        data.mocap_pos[len(valid)] = ee
+                        add_line(viewer, prev_ee, zero_ee, YELLOW)
+                        add_line(viewer, zero_ee, ee, YELLOW)
+                        viewer.sync()
+                    d = joint_distance(zero_pos, target)
+                    valid.append(target)
+                    via_home.append(True)
+                    current_pos = target.copy()
+                    prev_ee = ee
+                    print(f"  [{len(valid):3d}/{args.n_poses}] candidate {idx+1:4d} OK  "
+                          f"(via home) dist={d:.2f}  "
+                          f"[{', '.join(f'{a:+.2f}' for a in target)}]")
+                    advanced = True
+                    break
+
+                # Both failed — skip, stay at current_pos
+                if viewer is not None and n_fail < n_red:
                     data.mocap_pos[n_green + n_fail] = data.xpos[ee_body_id].copy()
                     viewer.sync()
-                    n_fail += 1
+                n_fail += 1
     finally:
         if viewer is not None:
             viewer.close()
@@ -202,11 +300,15 @@ def main():
     if len(valid) < args.n_poses:
         print(f"\nWARNING: only {len(valid)}/{args.n_poses} valid from "
               f"{checked} candidates. Increase --n-candidates.")
+    n_detours = sum(via_home)
+    if n_detours:
+        print(f"  {n_detours} poses required a home detour.")
 
     q_rad = np.array(valid)
     q_deg_kinova = np.rad2deg(q_rad)
 
-    np.savez(args.output, q_rad=q_rad, q_deg_kinova=q_deg_kinova)
+    np.savez(args.output, q_rad=q_rad, q_deg_kinova=q_deg_kinova,
+             via_home=np.array(via_home))
 
     rate = len(valid) / checked * 100 if checked else 0
     print(f"\n{len(valid)} valid poses ({rate:.0f}% acceptance). Saved to {args.output}")
