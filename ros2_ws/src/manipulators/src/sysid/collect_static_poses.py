@@ -11,11 +11,15 @@ Per pose records 5 statistics (mean, min, max, var, std) for:
   - q_ddot  (joint acceleration, deg/s², estimated from velocity)
   - tau     (joint torque, Nm)
 
+With --visualize, a MuJoCo viewer previews each motion before the real
+robot executes it. Close the viewer window to abort.
+
 No ROS required. Uses KinovaHardware directly.
 
 Usage:
     python collect_static_poses.py --poses poses.yaml --output gravity_data.yaml
-    python collect_static_poses.py --poses poses.yaml --test
+    python collect_static_poses.py --test
+    python collect_static_poses.py --test --visualize
 """
 
 import sys
@@ -74,8 +78,25 @@ def compute_stats(buf):
     }
 
 
+def preview_in_mujoco(sim_model, sim_data, viewer, target_rad,
+                      max_steps=3000, tol=0.02):
+    """Simulate motion to target in MuJoCo viewer. Non-blocking preview."""
+    import mujoco
+    sim_data.ctrl[:7] = target_rad
+    for _ in range(max_steps):
+        mujoco.mj_step(sim_model, sim_data)
+        viewer.sync()
+        if not viewer.is_running():
+            return False
+        if (np.max(np.abs(sim_data.qpos[:7] - target_rad)) < tol
+                and np.max(np.abs(sim_data.qvel[:7])) < 0.05):
+            break
+    return viewer.is_running()
+
+
 def collect(hw, configs_deg, speed, settle_timeout,
-            q_tol_deg, vel_tol_deg, acc_tol_deg, n_samples):
+            q_tol_deg, vel_tol_deg, acc_tol_deg, n_samples,
+            sim_model=None, sim_data=None, viewer=None):
     """Move to each config, wait until settled, record stats."""
     records = []
     n = len(configs_deg)
@@ -83,6 +104,18 @@ def collect(hw, configs_deg, speed, settle_timeout,
     for i, target_deg in enumerate(configs_deg):
         print(f"[{i+1}/{n}] -> {np.round(target_deg, 1)}", end="  ", flush=True)
 
+        # Preview in MuJoCo first
+        if viewer is not None:
+            if not viewer.is_running():
+                print("\nViewer closed, stopping.")
+                break
+            target_rad = np.deg2rad(target_deg)
+            print("(sim) ", end="", flush=True)
+            if not preview_in_mujoco(sim_model, sim_data, viewer, target_rad):
+                print("\nViewer closed, stopping.")
+                break
+
+        # Execute on real robot
         if not hw.go_to_joints(target_deg, duration=speed):
             print("SKIP (move failed)")
             continue
@@ -159,6 +192,8 @@ def main():
     parser.add_argument("--output", default="gravity_data.yaml")
     parser.add_argument("--test", action="store_true",
                         help="Test mode: run only the first 3 poses, save with _test suffix")
+    parser.add_argument("--visualize", action="store_true",
+                        help="Preview each motion in MuJoCo before executing on real robot")
     args = parser.parse_args()
 
     with open(args.poses, "r") as f:
@@ -174,6 +209,19 @@ def main():
         output_file = args.output
 
     print(f"Loaded {len(configs_deg)} poses from {args.poses}")
+
+    # Set up MuJoCo preview if requested
+    sim_model, sim_data, viewer = None, None, None
+    if args.visualize:
+        import mujoco
+        import mujoco.viewer
+        from generate_poses import load_scene
+        sim_model = load_scene(
+            str(Path(__file__).resolve().parent.parent.parent /
+                "assets" / "robots" / "kinova" / "mjcf" / "gen3.xml"))
+        sim_data = mujoco.MjData(sim_model)
+        viewer = mujoco.viewer.launch_passive(sim_model, sim_data)
+        print("MuJoCo viewer opened for preview")
 
     hw = KinovaHardware(args.ip)
     try:
@@ -191,12 +239,15 @@ def main():
         records = collect(
             hw, configs_deg, args.speed, args.settle_timeout,
             args.q_tol, args.vel_tol, args.acc_tol, args.n_samples,
+            sim_model=sim_model, sim_data=sim_data, viewer=viewer,
         )
 
         print("Returning to zero pose...")
         hw.go_to_joints(ZERO_DEG)
     finally:
         hw.disconnect()
+        if viewer is not None:
+            viewer.close()
 
     if len(records) == 0:
         sys.exit("No samples collected!")
