@@ -62,6 +62,19 @@ def load_static_data(yaml_path):
     # Negate torques: Kinova reports reaction torque, Pinocchio expects applied torque
     tau = -tau
 
+    # Joint torque offset corrections (empirically measured biases)
+    # These account for sensor calibration, friction, cable tension etc.
+    JOINT_OFFSETS = np.array([
+        -0.2093,  # J1
+        -0.8741,  # J2
+        -0.2108,  # J3
+        -0.0029,  # J4
+        -0.0086,  # J5
+        +1.2611,  # J6
+        +0.0385,  # J7
+    ])
+    tau -= JOINT_OFFSETS
+
     return q_rad, tau
 
 

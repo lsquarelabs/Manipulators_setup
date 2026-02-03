@@ -56,6 +56,19 @@ def load_data(yaml_path):
     # Negate torques: Kinova reports reaction torque, Pinocchio expects applied torque
     tau = -tau
 
+    # Joint torque offset corrections (empirically measured biases)
+    # These account for sensor calibration, friction, cable tension etc.
+    JOINT_OFFSETS = np.array([
+        -0.2093,  # J1
+        -0.8741,  # J2
+        -0.2108,  # J3
+        -0.0029,  # J4
+        -0.0086,  # J5
+        +1.2611,  # J6
+        +0.0385,  # J7
+    ])
+    tau -= JOINT_OFFSETS
+
     return q_rad, tau
 
 
@@ -87,14 +100,44 @@ def build_gravity_system(model, data, v_idx, q_info, q_all, tau_all):
     return np.vstack(Y_list), np.concatenate(res_list)
 
 
-def solve(Y, tau_res, lambda_reg):
-    """Regularized LS on active (non-zero) columns only."""
+def solve(Y, tau_res, lambda_reg, svd_thresh=None, fix_masses=False):
+    """Regularized LS on active (non-zero) columns only.
+
+    If svd_thresh is set, use SVD truncation to only identify well-conditioned
+    directions. svd_thresh is the ratio of smallest/largest singular value to keep.
+    If fix_masses is True, only identify CoM corrections (not mass corrections).
+    """
     col_norms = np.linalg.norm(Y, axis=0)
     active = col_norms > 1e-10
+
+    # Optionally fix masses (only allow first moment corrections)
+    if fix_masses:
+        n_bodies = Y.shape[1] // PARAMS_PER_BODY
+        for i in range(n_bodies):
+            mass_idx = i * PARAMS_PER_BODY
+            active[mass_idx] = False  # Don't identify mass
+        print(f"Fixing masses: {active.sum()} active params (CoM only)")
+
     Ya = Y[:, active]
 
-    A = Ya.T @ Ya + lambda_reg * np.eye(Ya.shape[1])
-    delta_active = np.linalg.solve(A, Ya.T @ tau_res)
+    if svd_thresh is not None:
+        # SVD truncation for numerical stability
+        U, s, Vt = np.linalg.svd(Ya, full_matrices=False)
+        # Keep singular values above threshold * max
+        thresh = svd_thresh * s[0]
+        keep = s > thresh
+        n_keep = np.sum(keep)
+        print(f"SVD: keeping {n_keep}/{len(s)} directions (thresh={thresh:.2e})")
+        print(f"Singular values: max={s[0]:.2e}, min_kept={s[keep][-1]:.2e}, min={s[-1]:.2e}")
+
+        # Truncated pseudoinverse: V @ diag(1/s) @ U'
+        s_inv = np.zeros_like(s)
+        s_inv[keep] = 1.0 / s[keep]
+        delta_active = Vt.T @ (s_inv * (U.T @ tau_res))
+    else:
+        # Standard regularized LS
+        A = Ya.T @ Ya + lambda_reg * np.eye(Ya.shape[1])
+        delta_active = np.linalg.solve(A, Ya.T @ tau_res)
 
     delta_pi = np.zeros(Y.shape[1])
     delta_pi[active] = delta_active
@@ -154,6 +197,10 @@ def main():
                         help=".yaml from collect_static_poses.py")
     parser.add_argument("--urdf", default=DEFAULT_URDF)
     parser.add_argument("--lambda-reg", type=float, default=1.0)
+    parser.add_argument("--svd-thresh", type=float, default=None,
+                        help="SVD truncation threshold (e.g., 1e-6). Keeps singular values > thresh*max.")
+    parser.add_argument("--fix-masses", action="store_true",
+                        help="Only identify CoM corrections, keep CAD masses fixed")
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default="gravity_corrections.yaml")
@@ -183,7 +230,7 @@ def main():
     )
 
     # Solve
-    delta_pi, active = solve(Y_train, res_train, args.lambda_reg)
+    delta_pi, active = solve(Y_train, res_train, args.lambda_reg, args.svd_thresh, args.fix_masses)
 
     # Evaluate
     rb_t, ra_t, pjb_t, pja_t = evaluate(Y_train, res_train, delta_pi)
