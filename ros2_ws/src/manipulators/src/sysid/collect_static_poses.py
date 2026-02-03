@@ -1,89 +1,176 @@
 #!/usr/bin/env python3
 """Collect static pose data for gravity identification.
 
-Loads pre-validated poses (from generate_poses.py), moves the arm to
-each one via Kinova's built-in planner, holds still, records averaged
-(q, tau).
+Loads sequentially-ordered poses (from generate_poses.py) and moves
+directly from one pose to the next (no home detour). The first pose
+is always zero (all joints at 0).
+
+Per pose records 5 statistics (mean, min, max, var, std) for:
+  - q       (joint position, deg)
+  - q_dot   (joint velocity, deg/s)
+  - q_ddot  (joint acceleration, deg/s², estimated from velocity)
+  - tau     (joint torque, Nm)
 
 No ROS required. Uses KinovaHardware directly.
 
 Usage:
-    python collect_static_poses.py --poses poses.npz --output gravity_data.npz
+    python collect_static_poses.py --poses poses.yaml --output gravity_data.yaml
+    python collect_static_poses.py --poses poses.yaml --test
 """
 
 import sys
 import time
 import argparse
 import numpy as np
+import yaml
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from hardware import KinovaHardware
 
-HOME_DEG = np.array([90.0, 30.0, 0.0, 90.0, 0.0, 60.0, -90.0])
+ZERO_DEG = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 
-def kinova_deg_to_rad(positions_deg):
-    """Kinova 0-360 degrees to radians (-pi, pi)."""
-    signed = positions_deg.copy()
-    signed[signed > 180.0] -= 360.0
-    return np.deg2rad(signed)
+def wait_until_settled(hw, q_tol_deg, vel_tol_deg, acc_tol_deg, timeout):
+    """Wait until velocity and acceleration are below thresholds.
+    Returns True if settled, False if timed out."""
+    t_end = time.time() + timeout
+    prev_vel = None
+    prev_t = None
+    while time.time() < t_end:
+        state = hw.read_state()
+        now = time.time()
+        vel = np.array(state.velocities_deg)
+
+        if prev_vel is not None and prev_t is not None:
+            dt = now - prev_t
+            if dt > 0:
+                acc = np.abs((vel - prev_vel) / dt)
+            else:
+                acc = np.full(7, np.inf)
+        else:
+            acc = np.full(7, np.inf)
+
+        prev_vel = vel.copy()
+        prev_t = now
+
+        if (np.max(np.abs(vel)) < vel_tol_deg
+                and np.max(acc) < acc_tol_deg):
+            return True
+
+        time.sleep(0.01)
+    return False
 
 
-def collect(hw, configs_deg, settle_time, record_time):
-    """Move to each config, hold, record averaged (q_rad, tau)."""
-    samples_q = []
-    samples_tau = []
+def compute_stats(buf):
+    """Compute 5 statistics over axis=0: mean, min, max, var, std."""
+    arr = np.array(buf)
+    return {
+        "mean": np.mean(arr, axis=0).tolist(),
+        "min": np.min(arr, axis=0).tolist(),
+        "max": np.max(arr, axis=0).tolist(),
+        "var": np.var(arr, axis=0).tolist(),
+        "std": np.std(arr, axis=0).tolist(),
+    }
+
+
+def collect(hw, configs_deg, speed, settle_timeout,
+            q_tol_deg, vel_tol_deg, acc_tol_deg, n_samples):
+    """Move to each config, wait until settled, record stats."""
+    records = []
     n = len(configs_deg)
 
     for i, target_deg in enumerate(configs_deg):
         print(f"[{i+1}/{n}] -> {np.round(target_deg, 1)}", end="  ", flush=True)
 
-        if not hw.go_to_joints(target_deg, duration=6.0):
+        if not hw.go_to_joints(target_deg, duration=speed):
             print("SKIP (move failed)")
             continue
 
-        time.sleep(settle_time)
-
-        state = hw.read_state()
-        if np.max(np.abs(state.velocities_deg)) > 2.0:
+        if not wait_until_settled(hw, q_tol_deg, vel_tol_deg, acc_tol_deg,
+                                  settle_timeout):
             print("SKIP (not settled)")
             continue
 
-        # Record at ~100 Hz
-        q_buf, tau_buf = [], []
-        t_end = time.time() + record_time
-        while time.time() < t_end:
+        # Check position error
+        state = hw.read_state()
+        q_err = np.max(np.abs(np.array(state.positions_deg) - target_deg))
+        if q_err > q_tol_deg:
+            print(f"SKIP (position error {q_err:.2f} > {q_tol_deg:.2f} deg)")
+            continue
+
+        # Record n_samples at ~100 Hz
+        q_buf, q_dot_buf, tau_buf, t_buf = [], [], [], []
+        for _ in range(n_samples):
             state = hw.read_state()
             q_buf.append(state.positions_deg.copy())
+            q_dot_buf.append(state.velocities_deg.copy())
             tau_buf.append(state.torques.copy())
+            t_buf.append(state.timestamp)
             time.sleep(0.01)
 
-        q_avg_deg = np.mean(q_buf, axis=0)
-        tau_avg = np.mean(tau_buf, axis=0)
-        tau_std = np.std(tau_buf, axis=0)
-        q_rad = kinova_deg_to_rad(q_avg_deg)
+        # Estimate acceleration from velocity
+        q_dot_arr = np.array(q_dot_buf)
+        t_arr = np.array(t_buf)
+        q_ddot_buf = []
+        for j in range(1, len(q_dot_arr)):
+            dt = t_arr[j] - t_arr[j - 1]
+            if dt > 0:
+                q_ddot_buf.append((q_dot_arr[j] - q_dot_arr[j - 1]) / dt)
+            else:
+                q_ddot_buf.append(np.zeros(7))
 
-        samples_q.append(q_rad)
-        samples_tau.append(tau_avg)
-        print(f"OK  tau=[{', '.join(f'{t:+.2f}' for t in tau_avg)}]  "
-              f"std_max={tau_std.max():.3f}")
+        record = {
+            "commanded_deg": target_deg.tolist(),
+            "q": compute_stats(q_buf),
+            "q_dot": compute_stats(q_dot_buf),
+            "q_ddot": compute_stats(q_ddot_buf),
+            "tau": compute_stats(tau_buf),
+        }
+        records.append(record)
 
-    return np.array(samples_q), np.array(samples_tau)
+        tau_mean = np.array(record["tau"]["mean"])
+        tau_std = np.array(record["tau"]["std"])
+        print(f"OK  tau=[{', '.join(f'{t:+.2f}' for t in tau_mean)}]  "
+              f"tau_std_max={tau_std.max():.3f}")
+
+    return records
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--poses", required=True,
-                        help=".npz from generate_poses.py")
+                        help=".yaml from generate_poses.py")
     parser.add_argument("--ip", default="192.168.1.10")
-    parser.add_argument("--settle", type=float, default=2.0)
-    parser.add_argument("--record", type=float, default=1.0)
-    parser.add_argument("--output", default="gravity_data.npz")
+    parser.add_argument("--speed", type=float, default=6.0,
+                        help="Motion duration per move (seconds)")
+    parser.add_argument("--settle-timeout", type=float, default=5.0,
+                        help="Max time to wait for settling (seconds)")
+    parser.add_argument("--q-tol", type=float, default=2.0,
+                        help="Position error threshold (degrees)")
+    parser.add_argument("--vel-tol", type=float, default=1.0,
+                        help="Velocity threshold to start recording (deg/s)")
+    parser.add_argument("--acc-tol", type=float, default=5.0,
+                        help="Acceleration threshold to start recording (deg/s^2)")
+    parser.add_argument("--n-samples", type=int, default=100,
+                        help="Number of samples to record per pose (at ~100 Hz)")
+    parser.add_argument("--output", default="gravity_data.yaml")
+    parser.add_argument("--test", action="store_true",
+                        help="Test mode: run only the first 3 poses, save with _test suffix")
     args = parser.parse_args()
 
-    poses = np.load(args.poses)
-    configs_deg = poses["q_deg_kinova"]
+    with open(args.poses, "r") as f:
+        poses_data = yaml.safe_load(f)
+    configs_deg = np.array(poses_data["q_deg"])
+
+    if args.test:
+        configs_deg = configs_deg[:3]
+        out_path = Path(args.output)
+        output_file = str(out_path.with_stem(out_path.stem + "_test"))
+        print("TEST MODE: running first 3 poses only")
+    else:
+        output_file = args.output
+
     print(f"Loaded {len(configs_deg)} poses from {args.poses}")
 
     hw = KinovaHardware(args.ip)
@@ -96,21 +183,30 @@ def main():
 
         hw.set_servoing_mode(low_level=False)
 
-        print("Going home...")
-        hw.go_to_joints(HOME_DEG)
+        print("Going to zero pose...")
+        hw.go_to_joints(ZERO_DEG)
 
-        q_all, tau_all = collect(hw, configs_deg, args.settle, args.record)
+        records = collect(
+            hw, configs_deg, args.speed, args.settle_timeout,
+            args.q_tol, args.vel_tol, args.acc_tol, args.n_samples,
+        )
 
-        print("Returning home...")
-        hw.go_to_joints(HOME_DEG)
+        print("Returning to zero pose...")
+        hw.go_to_joints(ZERO_DEG)
     finally:
         hw.disconnect()
 
-    if len(q_all) == 0:
+    if len(records) == 0:
         sys.exit("No samples collected!")
 
-    np.savez(args.output, q_rad=q_all, tau=tau_all)
-    print(f"\nSaved {len(q_all)} samples to {args.output}")
+    output = {
+        "n_poses": len(records),
+        "n_samples_per_pose": args.n_samples,
+        "poses": records,
+    }
+    with open(output_file, "w") as f:
+        yaml.dump(output, f, default_flow_style=None, sort_keys=False)
+    print(f"\nSaved {len(records)} poses to {output_file}")
 
 
 if __name__ == "__main__":

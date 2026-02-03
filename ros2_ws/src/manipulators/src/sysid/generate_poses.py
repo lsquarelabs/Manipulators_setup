@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """Generate collision-free joint configurations for gravity sysid.
 
-Loads the Kinova Gen3 MuJoCo model with a table, generates candidate
-configurations via Latin Hypercube Sampling, then builds a sequential
-chain using nearest-neighbor ordering: from the current pose, pick the
-closest untested candidate, simulate the direct transition, and accept
-if collision-free. The output sequence can be executed on the real robot
-without returning to home between poses.
+Three stages:
+  1. Static validation — LHS candidates checked for collision at the target
+     pose (fast, no motion sim). Produces green/red markers in viewer.
+  2. Nearest-neighbor ordering — greedy TSP to minimise joint travel.
+  3. Transition validation — simulate motion between consecutive poses,
+     drop pairs that collide in transit. Draws path lines in viewer.
 
 No ROS required.
 
 Usage:
-    python generate_poses.py --n-candidates 500 --n-poses 80 --output poses.npz
+    python generate_poses.py --n-candidates 500 --output poses.yaml
 """
 
 import os
 import argparse
 import numpy as np
+import yaml
 import mujoco
 import mujoco.viewer
 
@@ -144,9 +145,37 @@ def simulate_transition(model, data, start_rad, target_rad,
     return np.max(np.abs(data.qpos[:7] - target_rad)) < tol
 
 
+def is_pose_collision_free(model, data, q_rad):
+    """Check if a pose has any collision (static check, no motion sim)."""
+    set_arm_state(model, data, q_rad)
+    data.ctrl[:7] = q_rad
+    # Need a few substeps for contact detection to settle
+    for _ in range(5):
+        mujoco.mj_step(model, data)
+    return data.ncon == 0
+
+
 def joint_distance(a, b):
     """Max absolute joint difference (Chebyshev distance)."""
     return np.max(np.abs(a - b))
+
+
+def nearest_neighbor_order(poses, start=None):
+    """Greedy nearest-neighbor ordering. Returns index array."""
+    n = len(poses)
+    if start is None:
+        start = np.zeros(poses.shape[1])
+    visited = np.zeros(n, dtype=bool)
+    order = []
+    current = start
+    for _ in range(n):
+        dists = np.array([joint_distance(current, poses[j]) if not visited[j]
+                          else np.inf for j in range(n)])
+        idx = np.argmin(dists)
+        visited[idx] = True
+        order.append(idx)
+        current = poses[idx]
+    return np.array(order)
 
 
 def add_line(viewer, pos1, pos2, rgba):
@@ -186,9 +215,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--xml", default=DEFAULT_XML, help="Path to gen3.xml")
     p.add_argument("--n-candidates", type=int, default=500)
-    p.add_argument("--n-poses", type=int, default=80)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--output", default="poses.npz")
+    p.add_argument("--output", default="poses.yaml")
     p.add_argument("--visualize", action="store_true",
                    help="Open MuJoCo viewer to watch validation")
     p.add_argument("--light", action="store_true",
@@ -198,7 +226,7 @@ def main():
     rng = np.random.default_rng(args.seed)
 
     print(f"Loading {args.xml} ...")
-    n_green = args.n_poses if args.visualize else 0
+    n_green = args.n_candidates if args.visualize else 0
     n_red = args.n_candidates if args.visualize else 0
     model = load_scene(args.xml, n_green=n_green, n_red=n_red, light=args.light)
     data = mujoco.MjData(model)
@@ -207,111 +235,103 @@ def main():
                                     "end_effector_link")
 
     candidates = latin_hypercube(args.n_candidates, rng)
-    available = np.ones(args.n_candidates, dtype=bool)  # mask of unused candidates
 
     viewer = None
     if args.visualize:
         viewer = mujoco.viewer.launch_passive(model, data)
 
-    valid = []
-    via_home = []  # True if this pose required a home detour
-    n_fail = 0
-    checked = 0
-    zero_pos = np.zeros(7)
-    current_pos = zero_pos.copy()
-    # EE positions for line drawing
-    prev_ee = get_ee_pos(model, data, current_pos) if viewer else None
-    zero_ee = prev_ee  # cache zero-pose EE position
-
     GREEN = np.array([0, 255, 0, 180], dtype=np.uint8)
-    YELLOW = np.array([255, 255, 0, 180], dtype=np.uint8)
 
-    print(f"Building chain from {args.n_candidates} candidates for {args.n_poses} valid ...")
+    # ── Stage 1: Static pose validation ──────────────────────────────
+    print(f"[Stage 1] Checking {args.n_candidates} candidates for collision-free poses ...")
+    valid = []
+    n_green_placed = 0
+    n_red_placed = 0
+
+    for i, target in enumerate(candidates):
+        if viewer is not None and not viewer.is_running():
+            print("Viewer closed, stopping.")
+            break
+
+        if is_pose_collision_free(model, data, target):
+            ee = data.xpos[ee_body_id].copy()
+            if viewer is not None and n_green_placed < n_green:
+                data.mocap_pos[n_green_placed] = ee
+                viewer.sync()
+                n_green_placed += 1
+            valid.append(target)
+            print(f"  [{len(valid):3d}] candidate {i+1:4d} OK  "
+                  f"[{', '.join(f'{a:+.2f}' for a in target)}]")
+        else:
+            if viewer is not None and n_red_placed < n_red:
+                ee = data.xpos[ee_body_id].copy()
+                data.mocap_pos[n_green + n_red_placed] = ee
+                viewer.sync()
+                n_red_placed += 1
+
+    print(f"  {len(valid)}/{args.n_candidates} collision-free "
+          f"({len(valid)/args.n_candidates*100:.0f}% acceptance)")
+
+    if len(valid) == 0:
+        print("ERROR: no valid poses found.")
+        return
+
+    valid = np.array(valid)
+
+    # ── Stage 2: Nearest-neighbor ordering ───────────────────────────
+    print(f"\n[Stage 2] Ordering {len(valid)} poses by nearest-neighbor ...")
+    order = nearest_neighbor_order(valid, start=np.zeros(7))
+    valid = valid[order]
+    total_dist = sum(joint_distance(valid[i], valid[i+1])
+                     for i in range(len(valid)-1))
+    print(f"  Total path distance (Chebyshev): {total_dist:.1f} rad")
+
+    # ── Stage 3: Transition validation ───────────────────────────────
+    print(f"\n[Stage 3] Validating motion transitions ...")
+    keep = [True] * len(valid)
+    current_pos = np.zeros(7)
+    prev_ee = get_ee_pos(model, data, current_pos) if viewer else None
 
     try:
-        while len(valid) < args.n_poses and np.any(available):
+        for i, target in enumerate(valid):
             if viewer is not None and not viewer.is_running():
                 print("Viewer closed, stopping.")
                 break
 
-            # Find nearest available candidate to current position
-            dists = np.full(args.n_candidates, np.inf)
-            avail_idx = np.where(available)[0]
-            for idx in avail_idx:
-                dists[idx] = joint_distance(current_pos, candidates[idx])
-            order = np.argsort(dists)
-
-            advanced = False
-            for idx in order:
-                if not available[idx]:
-                    continue
-                target = candidates[idx]
-                available[idx] = False
-                checked += 1
-
-                # Try direct: current → target
-                if simulate_transition(model, data, current_pos, target,
-                                       viewer=viewer):
-                    ee = data.xpos[ee_body_id].copy()
-                    if viewer is not None:
-                        data.mocap_pos[len(valid)] = ee
-                        add_line(viewer, prev_ee, ee, GREEN)
-                        viewer.sync()
-                    d = joint_distance(current_pos, target)
-                    valid.append(target)
-                    via_home.append(False)
-                    current_pos = target.copy()
-                    prev_ee = ee
-                    print(f"  [{len(valid):3d}/{args.n_poses}] candidate {idx+1:4d} OK  "
-                          f"dist={d:.2f}  "
-                          f"[{', '.join(f'{a:+.2f}' for a in target)}]")
-                    advanced = True
-                    break
-
-                # Try via home: zero → target
-                if simulate_transition(model, data, zero_pos, target,
-                                       viewer=viewer):
-                    ee = data.xpos[ee_body_id].copy()
-                    if viewer is not None:
-                        data.mocap_pos[len(valid)] = ee
-                        add_line(viewer, prev_ee, zero_ee, YELLOW)
-                        add_line(viewer, zero_ee, ee, YELLOW)
-                        viewer.sync()
-                    d = joint_distance(zero_pos, target)
-                    valid.append(target)
-                    via_home.append(True)
-                    current_pos = target.copy()
-                    prev_ee = ee
-                    print(f"  [{len(valid):3d}/{args.n_poses}] candidate {idx+1:4d} OK  "
-                          f"(via home) dist={d:.2f}  "
-                          f"[{', '.join(f'{a:+.2f}' for a in target)}]")
-                    advanced = True
-                    break
-
-                # Both failed — skip, stay at current_pos
-                if viewer is not None and n_fail < n_red:
-                    data.mocap_pos[n_green + n_fail] = data.xpos[ee_body_id].copy()
+            if simulate_transition(model, data, current_pos, target,
+                                   viewer=viewer):
+                ee = data.xpos[ee_body_id].copy()
+                d = joint_distance(current_pos, target)
+                if viewer is not None:
+                    add_line(viewer, prev_ee, ee, GREEN)
                     viewer.sync()
-                n_fail += 1
+                    prev_ee = ee
+                current_pos = target.copy()
+                print(f"  [{i+1:3d}/{len(valid)}] OK   dist={d:.2f}")
+            else:
+                keep[i] = False
+                print(f"  [{i+1:3d}/{len(valid)}] SKIP (collision in transit)")
     finally:
         if viewer is not None:
             viewer.close()
 
-    if len(valid) < args.n_poses:
-        print(f"\nWARNING: only {len(valid)}/{args.n_poses} valid from "
-              f"{checked} candidates. Increase --n-candidates.")
-    n_detours = sum(via_home)
-    if n_detours:
-        print(f"  {n_detours} poses required a home detour.")
+    final = valid[keep]
+    n_dropped = len(valid) - len(final)
 
-    q_rad = np.array(valid)
-    q_deg_kinova = np.rad2deg(q_rad)
+    # Prepend zero pose as the first pose
+    q_rad = np.vstack([np.zeros(7), final])
+    q_deg = np.rad2deg(q_rad)
 
-    np.savez(args.output, q_rad=q_rad, q_deg_kinova=q_deg_kinova,
-             via_home=np.array(via_home))
+    output = {
+        "n_poses": int(len(q_deg)),
+        "q_deg": q_deg.tolist(),
+    }
+    with open(args.output, "w") as f:
+        yaml.dump(output, f, default_flow_style=None, sort_keys=False)
 
-    rate = len(valid) / checked * 100 if checked else 0
-    print(f"\n{len(valid)} valid poses ({rate:.0f}% acceptance). Saved to {args.output}")
+    print(f"\n{len(q_rad)} final poses (incl. zero) "
+          f"({n_dropped} dropped in transit validation). "
+          f"Saved to {args.output}")
 
 
 if __name__ == "__main__":
