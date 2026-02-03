@@ -35,12 +35,18 @@ from hardware import KinovaHardware
 ZERO_DEG = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 
-def wait_until_settled(hw, q_tol_deg, vel_tol_deg, acc_tol_deg, timeout):
-    """Wait until velocity and acceleration are below thresholds.
-    Returns True if settled, False if timed out."""
+def wait_until_settled(hw, vel_tol_deg, acc_tol_deg, timeout,
+                       window_size=20):
+    """Wait until ALL samples in a rolling window are below thresholds.
+    Window collects velocity and estimated acceleration at ~100 Hz.
+    Only considered settled when every sample in the buffer passes."""
+    from collections import deque
     t_end = time.time() + timeout
+    vel_history = deque(maxlen=window_size)
+    acc_history = deque(maxlen=window_size)
     prev_vel = None
     prev_t = None
+
     while time.time() < t_end:
         state = hw.read_state()
         now = time.time()
@@ -58,8 +64,13 @@ def wait_until_settled(hw, q_tol_deg, vel_tol_deg, acc_tol_deg, timeout):
         prev_vel = vel.copy()
         prev_t = now
 
-        if (np.max(np.abs(vel)) < vel_tol_deg
-                and np.max(acc) < acc_tol_deg):
+        vel_history.append(np.max(np.abs(vel)))
+        acc_history.append(np.max(acc))
+
+        # Only settled if buffer is full and ALL samples pass
+        if (len(vel_history) == window_size
+                and all(v < vel_tol_deg for v in vel_history)
+                and all(a < acc_tol_deg for a in acc_history)):
             return True
 
         time.sleep(0.01)
@@ -94,15 +105,47 @@ def preview_in_mujoco(sim_model, sim_data, viewer, target_rad,
     return viewer.is_running()
 
 
-def collect(hw, configs_deg, speed, settle_timeout,
+def format_eta(seconds):
+    """Format seconds into H:MM:SS."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+def save_records(records, n_samples, output_file):
+    """Save current records to YAML."""
+    output = {
+        "n_poses": len(records),
+        "n_samples_per_pose": n_samples,
+        "poses": records,
+    }
+    with open(output_file, "w") as f:
+        yaml.dump(output, f, default_flow_style=None, sort_keys=False)
+
+
+def collect(hw, configs_deg, speed, settle_timeout, settle_window,
             q_tol_deg, vel_tol_deg, acc_tol_deg, n_samples,
+            output_file=None,
             sim_model=None, sim_data=None, viewer=None):
-    """Move to each config, wait until settled, record stats."""
+    """Move to each config, wait until settled, record stats.
+    Saves to output_file after every successful pose."""
     records = []
     n = len(configs_deg)
+    iter_time = None
 
     for i, target_deg in enumerate(configs_deg):
-        print(f"[{i+1}/{n}] -> {np.round(target_deg, 1)}", end="  ", flush=True)
+        iter_start = time.time()
+
+        # ETA based on last iteration time
+        remaining = n - i
+        if iter_time is not None:
+            eta_str = format_eta(iter_time * remaining)
+        else:
+            eta_str = "--:--:--"
+
+        print(f"[{i+1}/{n}] ETA {eta_str}  -> {np.round(target_deg, 1)}",
+              end="  ", flush=True)
 
         # Preview in MuJoCo first
         if viewer is not None:
@@ -118,11 +161,13 @@ def collect(hw, configs_deg, speed, settle_timeout,
         # Execute on real robot
         if not hw.go_to_joints(target_deg, duration=speed):
             print("SKIP (move failed)")
+            iter_time = time.time() - iter_start
             continue
 
-        if not wait_until_settled(hw, q_tol_deg, vel_tol_deg, acc_tol_deg,
-                                  settle_timeout):
+        if not wait_until_settled(hw, vel_tol_deg, acc_tol_deg,
+                                  settle_timeout, settle_window):
             print("SKIP (not settled)")
+            iter_time = time.time() - iter_start
             continue
 
         # Check position error (wrap to ±180 to handle Kinova 0-360 range)
@@ -132,6 +177,7 @@ def collect(hw, configs_deg, speed, settle_timeout,
         q_err = np.max(np.abs(err))
         if q_err > q_tol_deg:
             print(f"SKIP (position error {q_err:.2f} > {q_tol_deg:.2f} deg)")
+            iter_time = time.time() - iter_start
             continue
 
         # Record n_samples at ~100 Hz
@@ -164,6 +210,12 @@ def collect(hw, configs_deg, speed, settle_timeout,
         }
         records.append(record)
 
+        # Save after every successful pose
+        if output_file is not None:
+            save_records(records, n_samples, output_file)
+
+        iter_time = time.time() - iter_start
+
         tau_mean = np.array(record["tau"]["mean"])
         tau_std = np.array(record["tau"]["std"])
         print(f"OK  tau=[{', '.join(f'{t:+.2f}' for t in tau_mean)}]  "
@@ -187,6 +239,8 @@ def main():
                         help="Velocity threshold to start recording (deg/s)")
     parser.add_argument("--acc-tol", type=float, default=0.5,
                         help="Acceleration threshold to start recording (deg/s^2)")
+    parser.add_argument("--settle-window", type=int, default=100,
+                        help="Number of consecutive samples that must all pass thresholds (~100Hz)")
     parser.add_argument("--n-samples", type=int, default=100,
                         help="Number of samples to record per pose (at ~100 Hz)")
     parser.add_argument("--output", default="gravity_data.yaml")
@@ -238,7 +292,8 @@ def main():
 
         records = collect(
             hw, configs_deg, args.speed, args.settle_timeout,
-            args.q_tol, args.vel_tol, args.acc_tol, args.n_samples,
+            args.settle_window, args.q_tol, args.vel_tol, args.acc_tol,
+            args.n_samples, output_file=output_file,
             sim_model=sim_model, sim_data=sim_data, viewer=viewer,
         )
 
@@ -252,14 +307,7 @@ def main():
     if len(records) == 0:
         sys.exit("No samples collected!")
 
-    output = {
-        "n_poses": len(records),
-        "n_samples_per_pose": args.n_samples,
-        "poses": records,
-    }
-    with open(output_file, "w") as f:
-        yaml.dump(output, f, default_flow_style=None, sort_keys=False)
-    print(f"\nSaved {len(records)} poses to {output_file}")
+    print(f"\nDone. {len(records)} poses saved to {output_file}")
 
 
 if __name__ == "__main__":
