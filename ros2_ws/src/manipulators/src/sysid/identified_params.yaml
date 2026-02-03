@@ -1,0 +1,68 @@
+method: full_sysid
+lambda_reg: 0.1
+n_samples: 94
+n_active_params: 50
+rmse_train: 6.47023754070454
+rmse_val: 6.416911007288389
+per_joint_rmse_val: [0.598875661086144, 14.994137721520975, 4.608474619794762, 5.965080703912577,
+  1.553338446223378, 1.9405758897238499, 0.23556065260753561]
+parameters: [0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0]
+active: [false, true, true, false, false, false, false, false, false, false, true,
+  true, true, true, false, false, false, false, false, false, true, true, true, true,
+  false, false, false, false, false, false, true, true, true, true, false, false,
+  false, false, false, false, true, true, true, true, false, false, false, false,
+  false, false, true, true, true, true, false, false, false, false, false, false,
+  true, true, true, true, false, false, false, false, false, false, true, true, true,
+  true, false, false, false, false, false, false, true, true, true, true, false, false,
+  false, false, false, false, true, true, true, true, false, false, false, false,
+  false, false, true, true, true, true, false, false, false, false, false, false,
+  true, true, true, true, false, false, false, false, false, false, true, true, true,
+  true, false, false, false, false, false, false]
+bodies:
+- name: universe
+  mass: 0.01
+  first_moment: [0.0, 0.0, 0.0]
+- name: gen3_joint_1
+  mass: 0.01
+  first_moment: [0.0, 0.0, 0.0]
+- name: gen3_joint_2
+  mass: 0.01
+  first_moment: [0.0, 0.0, 0.0]
+- name: gen3_joint_3
+  mass: 0.01
+  first_moment: [0.0, 0.0, 0.0]
+- name: gen3_joint_4
+  mass: 0.01
+  first_moment: [0.0, 0.0, 0.0]
+- name: gen3_joint_5
+  mass: 0.01
+  first_moment: [0.0, 0.0, 0.0]
+- name: gen3_joint_6
+  mass: 0.01
+  first_moment: [0.0, 0.0, 0.0]
+- name: gen3_joint_7
+  mass: 0.01
+  first_moment: [0.0, 0.0, 0.0]
+- name: gen3_robotiq_85_left_inner_knuckle_joint
+  mass: 0.01
+  first_moment: [0.0, 0.0, 0.0]
+- name: gen3_robotiq_85_left_knuckle_joint
+  mass: 0.01
+  first_moment: [0.0, 0.0, 0.0]
+- name: gen3_robotiq_85_left_finger_tip_joint
+  mass: 0.01
+  first_moment: [0.0, 0.0, 0.0]
+- name: gen3_robotiq_85_right_inner_knuckle_joint
+  mass: 0.01
+  first_moment: [0.0, 0.0, 0.0]
+- name: gen3_robotiq_85_right_knuckle_joint
+  mass: 0.01
+  first_moment: [0.0, 0.0, 0.0]
