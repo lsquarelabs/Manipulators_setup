@@ -59,6 +59,9 @@ def load_static_data(yaml_path):
     q_signed[q_signed > 180.0] -= 360.0
     q_rad = np.deg2rad(q_signed)
 
+    # Negate torques: Kinova reports reaction torque, Pinocchio expects applied torque
+    tau = -tau
+
     return q_rad, tau
 
 
@@ -285,7 +288,7 @@ def compare_with_cad(pi_identified, model):
 
 def main():
     parser = argparse.ArgumentParser(description="Full system identification")
-    parser.add_argument("--data", default="gravity_data.yaml",
+    parser.add_argument("--data", default="gravity_data_combined.yaml",
                         help="Static pose data from collect_static_poses.py")
     parser.add_argument("--urdf", default=DEFAULT_URDF)
     parser.add_argument("--lambda-reg", type=float, default=0.1,

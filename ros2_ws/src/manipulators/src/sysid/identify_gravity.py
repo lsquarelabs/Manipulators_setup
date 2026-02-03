@@ -53,6 +53,9 @@ def load_data(yaml_path):
     q_signed[q_signed > 180.0] -= 360.0
     q_rad = np.deg2rad(q_signed)
 
+    # Negate torques: Kinova reports reaction torque, Pinocchio expects applied torque
+    tau = -tau
+
     return q_rad, tau
 
 
@@ -147,7 +150,7 @@ def apply_corrections(model, delta_pi):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default="gravity_data.yaml",
+    parser.add_argument("--data", default="gravity_data_combined.yaml",
                         help=".yaml from collect_static_poses.py")
     parser.add_argument("--urdf", default=DEFAULT_URDF)
     parser.add_argument("--lambda-reg", type=float, default=1.0)

@@ -32,11 +32,11 @@ DEFAULT_XML = os.path.join(
 # Revolute joints: slightly inside gen3.xml ctrlrange
 JOINT_RANGES_DEG = [
     [(-143, 143)],    # J1 continuous
-    [(-120, -80), (80,120)],    # J2 (ctrlrange ±2.25 rad ≈ ±129°)
+    [(-120, -60), (60,120)],    # J2 (ctrlrange ±2.25 rad ≈ ±129°)
     [(-143, 143)],    # J3 continuous
-    [(-10, 10), (-10,10)],    # J4 (ctrlrange ±2.58 rad ≈ ±148°)
+    [(-30, 30), (-30,30)],    # J4 (ctrlrange ±2.58 rad ≈ ±148°)
     [(-143, 143)],    # J5 continuous
-    [(-10, 10), (-10,10)],    # J6 (ctrlrange ±2.10 rad ≈ ±120°)
+    [(-30, 30), (-30,30)],    # J6 (ctrlrange ±2.10 rad ≈ ±120°)
     [(-143, 143)],    # J7 continuous
 ]
 
@@ -49,8 +49,8 @@ SCENE_TEMPLATE = """\
   <worldbody>
 {lighting}
     <body name="table">
-      <geom name="table_geom" type="box" pos="0 0 -0.025"
-            size="0.8 0.8 0.025" rgba="0.6 0.5 0.4 1"/>
+      <geom name="table_geom" type="box" pos="0 0 0.125"
+            size="1.6 1.6 0.025" rgba="0.6 0.5 0.4 1"/>
     </body>
 {markers}
   </worldbody>
@@ -409,7 +409,15 @@ def main():
 
     # ── Stage 3: Transition validation ───────────────────────────────
     print(f"\n[Stage 3] Validating motion transitions ...")
+
+    # Move table down to z=5cm for motion validation
+    table_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table_geom")
+    if table_geom_id >= 0:
+        model.geom_pos[table_geom_id][2] = 0.025  # table top at z=5cm
+        print("  (table moved to z=5cm for motion validation)")
+
     keep = [True] * len(valid)
+    via_zero = [False] * len(valid)  # Track which poses needed via-zero path
     current_pos = np.zeros(7)
     prev_ee = get_ee_pos(model, data, current_pos) if viewer else None
 
@@ -463,6 +471,7 @@ def main():
                             viewer.sync()
                             prev_ee = ee
                         current_pos = target.copy()
+                        via_zero[i] = True  # Mark this pose as needing via-zero
                         print(f"        -> via zero: OK")
                     else:
                         keep[i] = False
@@ -482,22 +491,28 @@ def main():
             viewer.close()
 
     final = valid[keep]
+    final_via_zero = [v for v, k in zip(via_zero, keep) if k]
     n_dropped = len(valid) - len(final)
+    n_via_zero = sum(final_via_zero)
 
     # Prepend zero pose as the first pose
     q_rad = np.vstack([np.zeros(7), final])
     q_deg = np.rad2deg(q_rad)
 
+    # go_to_zero_before: False for first pose (already at zero), then the via_zero flags
+    go_to_zero_before = [False] + final_via_zero
+
     output = {
         "n_poses": int(len(q_deg)),
+        "n_via_zero": n_via_zero,
         "q_deg": q_deg.tolist(),
+        "go_to_zero_before": go_to_zero_before,
     }
     with open(args.output, "w") as f:
         yaml.dump(output, f, default_flow_style=None, sort_keys=False)
 
-    print(f"\n{len(q_rad)} final poses (incl. zero) "
-          f"({n_dropped} dropped in transit validation). "
-          f"Saved to {args.output}")
+    print(f"\n{len(q_rad)} final poses (incl. zero), {n_via_zero} need via-zero "
+          f"({n_dropped} dropped). Saved to {args.output}")
 
 
 if __name__ == "__main__":

@@ -126,15 +126,24 @@ def save_records(records, n_samples, output_file):
 
 def collect(hw, configs_deg, speed, settle_timeout, settle_window,
             q_tol_deg, vel_tol_deg, acc_tol_deg, n_samples,
-            output_file=None,
+            output_file=None, go_to_zero_before=None,
             sim_model=None, sim_data=None, viewer=None):
     """Move to each config, wait until settled, record stats.
-    Saves to output_file after every successful pose."""
+    Saves to output_file after every successful pose.
+    If go_to_zero_before[i] is True, goes to zero pose before pose i."""
     records = []
     n = len(configs_deg)
     iter_time = None
 
     for i, target_deg in enumerate(configs_deg):
+        # Go to zero first if needed
+        if go_to_zero_before is not None and go_to_zero_before[i]:
+            print(f"  [->0] Going to zero before pose {i+1}...", end=" ", flush=True)
+            if viewer is not None and viewer.is_running():
+                preview_in_mujoco(sim_model, sim_data, viewer, np.zeros(7))
+            hw.go_to_joints(ZERO_DEG, duration=speed)
+            wait_until_settled(hw, vel_tol_deg, acc_tol_deg, settle_timeout, settle_window)
+            print("OK")
         iter_start = time.time()
 
         # ETA based on last iteration time
@@ -253,16 +262,20 @@ def main():
     with open(args.poses, "r") as f:
         poses_data = yaml.safe_load(f)
     configs_deg = np.array(poses_data["q_deg"])
+    go_to_zero_before = poses_data.get("go_to_zero_before", None)
 
     if args.test:
         configs_deg = configs_deg[:3]
+        if go_to_zero_before is not None:
+            go_to_zero_before = go_to_zero_before[:3]
         out_path = Path(args.output)
         output_file = str(out_path.with_stem(out_path.stem + "_test"))
         print("TEST MODE: running first 3 poses only")
     else:
         output_file = args.output
 
-    print(f"Loaded {len(configs_deg)} poses from {args.poses}")
+    n_via_zero = sum(go_to_zero_before) if go_to_zero_before else 0
+    print(f"Loaded {len(configs_deg)} poses from {args.poses} ({n_via_zero} via-zero transitions)")
 
     # Set up MuJoCo preview if requested
     sim_model, sim_data, viewer = None, None, None
@@ -294,6 +307,7 @@ def main():
             hw, configs_deg, args.speed, args.settle_timeout,
             args.settle_window, args.q_tol, args.vel_tol, args.acc_tol,
             args.n_samples, output_file=output_file,
+            go_to_zero_before=go_to_zero_before,
             sim_model=sim_model, sim_data=sim_data, viewer=viewer,
         )
 
