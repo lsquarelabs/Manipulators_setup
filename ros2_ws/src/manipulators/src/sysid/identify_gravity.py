@@ -56,20 +56,28 @@ def load_data(yaml_path):
     # Negate torques: Kinova reports reaction torque, Pinocchio expects applied torque
     tau = -tau
 
-    # Joint torque offset corrections (empirically measured biases)
-    # These account for sensor calibration, friction, cable tension etc.
-    JOINT_OFFSETS = np.array([
-        -0.2093,  # J1
-        -0.8741,  # J2
-        -0.2108,  # J3
-        -0.0029,  # J4
-        -0.0086,  # J5
-        +1.2611,  # J6
-        +0.0385,  # J7
-    ])
-    tau -= JOINT_OFFSETS
-
     return q_rad, tau
+
+
+def compute_joint_offsets(model, data, v_idx, q_info, q_all, tau_all):
+    """Compute mean torque offset (bias) for each joint.
+
+    Returns the mean residual (measured - model) for each joint,
+    which represents systematic sensor bias, friction, cable tension, etc.
+    """
+    q_full = pin.neutral(model)
+    residuals = []
+
+    for q_arm, tau_meas in zip(q_all, tau_all):
+        set_arm_q(q_full, q_arm, q_info)
+        pin.computeGeneralizedGravity(model, data, q_full)
+        tau_model = data.g[v_idx]
+        residuals.append(tau_meas - tau_model)
+
+    residuals = np.array(residuals)
+    offsets = np.mean(residuals, axis=0)
+
+    return offsets
 
 
 def set_arm_q(q_full, q_arm, q_info):
@@ -201,6 +209,8 @@ def main():
                         help="SVD truncation threshold (e.g., 1e-6). Keeps singular values > thresh*max.")
     parser.add_argument("--fix-masses", action="store_true",
                         help="Only identify CoM corrections, keep CAD masses fixed")
+    parser.add_argument("--offset-correction", action="store_true",
+                        help="Compute and apply per-joint torque offset corrections")
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default="gravity_corrections.yaml")
@@ -211,15 +221,25 @@ def main():
     N = len(q_all)
     print(f"Loaded {N} samples")
 
+    # Model
+    model, data, v_idx, q_info = load_model(args.urdf)
+
+    # Compute and apply joint torque offsets if requested
+    joint_offsets = None
+    if args.offset_correction:
+        joint_offsets = compute_joint_offsets(model, data, v_idx, q_info, q_all, tau_all)
+        print(f"\nComputed joint torque offsets:")
+        for j, off in enumerate(joint_offsets):
+            print(f"  J{j+1}: {off:+.4f} Nm")
+        tau_all = tau_all - joint_offsets
+        print()
+
     # Split
     rng = np.random.default_rng(args.seed)
     idx = rng.permutation(N)
     n_val = max(1, int(N * args.val_ratio))
     val_idx, train_idx = idx[:n_val], idx[n_val:]
     print(f"Train: {len(train_idx)}, Val: {len(val_idx)}")
-
-    # Model
-    model, data, v_idx, q_info = load_model(args.urdf)
 
     # Build systems
     Y_train, res_train = build_gravity_system(
@@ -263,6 +283,8 @@ def main():
         "per_joint_rmse_val_before": pjb_v.tolist(),
         "per_joint_rmse_val_after": pja_v.tolist(),
     }
+    if joint_offsets is not None:
+        output["joint_torque_offsets"] = joint_offsets.tolist()
     with open(args.output, "w") as f:
         yaml.dump(output, f, default_flow_style=None, sort_keys=False)
     print(f"\nSaved corrections to {args.output}")
