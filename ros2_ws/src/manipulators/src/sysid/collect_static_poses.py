@@ -92,9 +92,11 @@ def collect(hw, configs_deg, speed, settle_timeout,
             print("SKIP (not settled)")
             continue
 
-        # Check position error
+        # Check position error (wrap to ±180 to handle Kinova 0-360 range)
         state = hw.read_state()
-        q_err = np.max(np.abs(np.array(state.positions_deg) - target_deg))
+        err = np.array(state.positions_deg) - target_deg
+        err = (err + 180.0) % 360.0 - 180.0
+        q_err = np.max(np.abs(err))
         if q_err > q_tol_deg:
             print(f"SKIP (position error {q_err:.2f} > {q_tol_deg:.2f} deg)")
             continue
@@ -148,9 +150,9 @@ def main():
                         help="Max time to wait for settling (seconds)")
     parser.add_argument("--q-tol", type=float, default=2.0,
                         help="Position error threshold (degrees)")
-    parser.add_argument("--vel-tol", type=float, default=1.0,
+    parser.add_argument("--vel-tol", type=float, default=0.05,
                         help="Velocity threshold to start recording (deg/s)")
-    parser.add_argument("--acc-tol", type=float, default=5.0,
+    parser.add_argument("--acc-tol", type=float, default=0.5,
                         help="Acceleration threshold to start recording (deg/s^2)")
     parser.add_argument("--n-samples", type=int, default=100,
                         help="Number of samples to record per pose (at ~100 Hz)")
