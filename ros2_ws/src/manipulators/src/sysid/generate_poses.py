@@ -26,18 +26,19 @@ DEFAULT_XML = os.path.join(
     "assets", "robots", "kinova", "mjcf", "gen3.xml",
 )
 
-# Sampling limits (radians). Conservative to avoid cable wrap.
-# Continuous joints (1,3,5,7): ±2.5 rad
+# Sampling limits (degrees). Each joint has a list of (min, max) intervals.
+# Use multiple intervals for mirrored ranges, e.g., [(-90, -60), (60, 90)]
+# Continuous joints (1,3,5,7): ±143 deg (~2.5 rad)
 # Revolute joints: slightly inside gen3.xml ctrlrange
-JOINT_LIMITS_RAD = np.array([
-    [-2.5,  2.5 ],  # J1 continuous
-    [-2.20, 2.20],  # J2 (ctrlrange ±2.25)
-    [-2.5,  2.5 ],  # J3 continuous
-    [-2.50, 2.50],  # J4 (ctrlrange ±2.58)
-    [-2.5,  2.5 ],  # J5 continuous
-    [-2.05, 2.05],  # J6 (ctrlrange ±2.10)
-    [-2.5,  2.5 ],  # J7 continuous
-])
+JOINT_RANGES_DEG = [
+    [(-143, 143)],    # J1 continuous
+    [(-120, -80), (80,120)],    # J2 (ctrlrange ±2.25 rad ≈ ±129°)
+    [(-143, 143)],    # J3 continuous
+    [(-10, 10), (-10,10)],    # J4 (ctrlrange ±2.58 rad ≈ ±148°)
+    [(-143, 143)],    # J5 continuous
+    [(-10, 10), (-10,10)],    # J6 (ctrlrange ±2.10 rad ≈ ±120°)
+    [(-143, 143)],    # J7 continuous
+]
 
 SCENE_TEMPLATE = """\
 <mujoco model="sysid_scene">
@@ -56,9 +57,63 @@ SCENE_TEMPLATE = """\
   <contact>
     <exclude body1="base_link" body2="table"/>
     <exclude body1="base_link" body2="shoulder_link"/>
+    <exclude body1="base_mount" body2="table"/>
+    <exclude body1="base" body2="table"/>
   </contact>
 </mujoco>
 """
+
+
+def latin_hypercube_with_ranges(n, joint_ranges_deg, rng):
+    """Latin hypercube sampling with custom joint ranges (in degrees).
+
+    joint_ranges_deg: list of 7 elements, each is a list of (lo, hi) tuples in degrees.
+                      For mirrored ranges, use multiple tuples, e.g., [(-90, -60), (60, 90)].
+    Returns: configs in radians.
+    """
+    configs = np.zeros((n, 7))
+
+    for j in range(7):
+        ranges = joint_ranges_deg[j]
+
+        if len(ranges) == 1:
+            # Simple single range
+            lo, hi = ranges[0]
+            edges = np.linspace(lo, hi, n + 1)
+            for i in range(n):
+                configs[i, j] = rng.uniform(edges[i], edges[i + 1])
+            rng.shuffle(configs[:, j])
+        else:
+            # Multiple ranges (e.g., mirrored)
+            # Calculate total span and allocate samples proportionally
+            spans = [(hi - lo) for lo, hi in ranges]
+            total_span = sum(spans)
+
+            # Allocate samples to each range proportionally
+            allocations = []
+            remaining = n
+            for k, span in enumerate(spans):
+                if k == len(spans) - 1:
+                    alloc = remaining  # Last range gets the rest
+                else:
+                    alloc = int(round(n * span / total_span))
+                    remaining -= alloc
+                allocations.append(alloc)
+
+            # Generate LHS samples for each sub-range
+            values = []
+            for (lo, hi), alloc in zip(ranges, allocations):
+                if alloc > 0:
+                    edges = np.linspace(lo, hi, alloc + 1)
+                    for i in range(alloc):
+                        values.append(rng.uniform(edges[i], edges[i + 1]))
+
+            values = np.array(values)
+            rng.shuffle(values)
+            configs[:, j] = values
+
+    # Convert to radians
+    return np.deg2rad(configs)
 
 
 def load_scene(gen3_xml_path, n_green=0, n_red=0, light=False):
@@ -103,18 +158,6 @@ def load_scene(gen3_xml_path, n_green=0, n_red=0, light=False):
     return model
 
 
-def latin_hypercube(n, rng):
-    """Latin hypercube sampling across joint limits (radians)."""
-    configs = np.zeros((n, 7))
-    for j in range(7):
-        lo, hi = JOINT_LIMITS_RAD[j]
-        edges = np.linspace(lo, hi, n + 1)
-        for i in range(n):
-            configs[i, j] = rng.uniform(edges[i], edges[i + 1])
-        rng.shuffle(configs[:, j])
-    return configs
-
-
 def set_arm_state(model, data, q_rad):
     """Set the arm to a specific joint configuration (position, zero velocity)."""
     data.qpos[:7] = q_rad
@@ -122,27 +165,84 @@ def set_arm_state(model, data, q_rad):
     mujoco.mj_forward(model, data)
 
 
+def get_geom_label(model, geom_id):
+    """Get a readable label for a geom (prefer body name if geom unnamed)."""
+    geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+    if geom_name:
+        return geom_name
+    # Geom unnamed, use parent body name
+    body_id = model.geom_bodyid[geom_id]
+    body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+    return body_name or f"body{body_id}"
+
+
+def get_collision_info(model, data):
+    """Get info about current collisions."""
+    collisions = []
+    for i in range(data.ncon):
+        contact = data.contact[i]
+        label1 = get_geom_label(model, contact.geom1)
+        label2 = get_geom_label(model, contact.geom2)
+        collisions.append((label1, label2))
+    return collisions
+
+
 def simulate_transition(model, data, start_rad, target_rad,
-                        max_steps=3000, tol=0.02, viewer=None):
-    """Simulate start → target. Returns True if no collision and converged."""
+                        max_steps=3000, tol=0.03, viewer=None,
+                        n_waypoints=20, steps_per_waypoint=150):
+    """Simulate start → target with interpolated waypoints to avoid overshoot.
+
+    Returns: (success, info_dict)
+        success: True if no collision and converged
+        info_dict: {'collisions': [...], 'q_deg': [...], 'step': int} or None
+    """
     saved_mocap = data.mocap_pos.copy() if model.nmocap > 0 else None
     data.time = 0.0
     set_arm_state(model, data, start_rad)
     if saved_mocap is not None:
         data.mocap_pos[:] = saved_mocap
-    data.ctrl[:7] = target_rad
 
-    for _ in range(max_steps):
-        mujoco.mj_step(model, data)
-        if viewer is not None:
-            viewer.sync()
-        if data.ncon > 0:
-            return False
-        if (np.max(np.abs(data.qpos[:7] - target_rad)) < tol
-                and np.max(np.abs(data.qvel[:7])) < 0.05):
-            return True
+    # Interpolate waypoints from start to target
+    alphas = np.linspace(0, 1, n_waypoints + 1)[1:]  # skip 0 (start)
 
-    return np.max(np.abs(data.qpos[:7] - target_rad)) < tol
+    global_step = 0
+    for waypoint_idx, alpha in enumerate(alphas):
+        waypoint = start_rad + alpha * (target_rad - start_rad)
+        data.ctrl[:7] = waypoint
+
+        for step in range(steps_per_waypoint):
+            mujoco.mj_step(model, data)
+            global_step += 1
+            if viewer is not None:
+                viewer.sync()
+            if data.ncon > 0:
+                info = {
+                    'collisions': get_collision_info(model, data),
+                    'q_deg': np.rad2deg(data.qpos[:7]).tolist(),
+                    'step': global_step,
+                }
+                return False, info
+
+            # Check if reached this waypoint
+            if (np.max(np.abs(data.qpos[:7] - waypoint)) < tol
+                    and np.max(np.abs(data.qvel[:7])) < 0.15):
+                break
+
+    # Final convergence check
+    pos_err = np.max(np.abs(data.qpos[:7] - target_rad))
+    vel_err = np.max(np.abs(data.qvel[:7]))
+    converged = pos_err < tol and vel_err < 0.15
+    if not converged:
+        info = {
+            'collisions': [],
+            'q_deg': np.rad2deg(data.qpos[:7]).tolist(),
+            'step': global_step,
+            'timeout': True,
+            'pos_err': pos_err,
+            'vel_err': vel_err,
+        }
+        return False, info
+    return True, None
 
 
 def is_pose_collision_free(model, data, q_rad):
@@ -161,7 +261,7 @@ def joint_distance(a, b):
 
 
 def nearest_neighbor_order(poses, start=None):
-    """Greedy nearest-neighbor ordering. Returns index array."""
+    """Greedy nearest-neighbor ordering by joint distance. Returns index array."""
     n = len(poses)
     if start is None:
         start = np.zeros(poses.shape[1])
@@ -175,6 +275,22 @@ def nearest_neighbor_order(poses, start=None):
         visited[idx] = True
         order.append(idx)
         current = poses[idx]
+    return np.array(order)
+
+
+def nearest_neighbor_order_ee(ee_positions, start_ee):
+    """Greedy nearest-neighbor ordering by EE Euclidean distance. Returns index array."""
+    n = len(ee_positions)
+    visited = np.zeros(n, dtype=bool)
+    order = []
+    current = start_ee
+    for _ in range(n):
+        dists = np.array([np.linalg.norm(current - ee_positions[j]) if not visited[j]
+                          else np.inf for j in range(n)])
+        idx = np.argmin(dists)
+        visited[idx] = True
+        order.append(idx)
+        current = ee_positions[idx]
     return np.array(order)
 
 
@@ -234,7 +350,12 @@ def main():
     ee_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
                                     "end_effector_link")
 
-    candidates = latin_hypercube(args.n_candidates, rng)
+    # Generate candidates using JOINT_RANGES_DEG
+    print("Joint ranges (deg):")
+    for j, ranges in enumerate(JOINT_RANGES_DEG):
+        range_strs = [f"[{lo}, {hi}]" for lo, hi in ranges]
+        print(f"  J{j+1}: {' ∪ '.join(range_strs)}")
+    candidates = latin_hypercube_with_ranges(args.n_candidates, JOINT_RANGES_DEG, rng)
 
     viewer = None
     if args.visualize:
@@ -292,14 +413,18 @@ def main():
     current_pos = np.zeros(7)
     prev_ee = get_ee_pos(model, data, current_pos) if viewer else None
 
+    zero_pose = np.zeros(7)
+    zero_ee = get_ee_pos(model, data, zero_pose) if viewer else None
+
     try:
         for i, target in enumerate(valid):
             if viewer is not None and not viewer.is_running():
                 print("Viewer closed, stopping.")
                 break
 
-            if simulate_transition(model, data, current_pos, target,
-                                   viewer=viewer):
+            success, info = simulate_transition(model, data, current_pos, target,
+                                                viewer=viewer)
+            if success:
                 ee = data.xpos[ee_body_id].copy()
                 d = joint_distance(current_pos, target)
                 if viewer is not None:
@@ -309,8 +434,49 @@ def main():
                 current_pos = target.copy()
                 print(f"  [{i+1:3d}/{len(valid)}] OK   dist={d:.2f}")
             else:
-                keep[i] = False
-                print(f"  [{i+1:3d}/{len(valid)}] SKIP (collision in transit)")
+                # Direct path failed, try via zero pose
+                if info and info['collisions']:
+                    pairs = ", ".join(f"{g1}<->{g2}" for g1, g2 in info['collisions'][:3])
+                    print(f"  [{i+1:3d}/{len(valid)}] direct FAIL: {pairs}")
+                elif info and info.get('timeout'):
+                    print(f"  [{i+1:3d}/{len(valid)}] direct FAIL: timeout (pos_err={info['pos_err']:.3f}, vel_err={info['vel_err']:.3f})")
+                else:
+                    print(f"  [{i+1:3d}/{len(valid)}] direct FAIL")
+
+                # Go back to zero
+                success_to_zero, _ = simulate_transition(model, data, current_pos, zero_pose,
+                                                         viewer=viewer)
+                if success_to_zero:
+                    if viewer is not None:
+                        add_line(viewer, prev_ee, zero_ee, GREEN)
+                        viewer.sync()
+                        prev_ee = zero_ee
+                    current_pos = zero_pose.copy()
+
+                    # Try zero → target
+                    success_from_zero, info2 = simulate_transition(model, data, zero_pose, target,
+                                                                   viewer=viewer)
+                    if success_from_zero:
+                        ee = data.xpos[ee_body_id].copy()
+                        if viewer is not None:
+                            add_line(viewer, prev_ee, ee, GREEN)
+                            viewer.sync()
+                            prev_ee = ee
+                        current_pos = target.copy()
+                        print(f"        -> via zero: OK")
+                    else:
+                        keep[i] = False
+                        if info2 and info2['collisions']:
+                            pairs2 = ", ".join(f"{g1}<->{g2}" for g1, g2 in info2['collisions'][:3])
+                            print(f"        -> via zero: SKIP ({pairs2})")
+                        elif info2 and info2.get('timeout'):
+                            print(f"        -> via zero: SKIP (timeout pos_err={info2['pos_err']:.3f})")
+                        else:
+                            print(f"        -> via zero: SKIP")
+                else:
+                    # Can't even go back to zero, skip this pose
+                    keep[i] = False
+                    print(f"        -> can't return to zero, SKIP")
     finally:
         if viewer is not None:
             viewer.close()
