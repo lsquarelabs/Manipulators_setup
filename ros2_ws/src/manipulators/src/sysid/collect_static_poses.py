@@ -139,7 +139,7 @@ def collect(hw, configs_deg, speed, settle_timeout,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--poses", required=True,
+    parser.add_argument("--poses", default="poses.yaml",
                         help=".yaml from generate_poses.py")
     parser.add_argument("--ip", default="192.168.1.10")
     parser.add_argument("--speed", type=float, default=6.0,
