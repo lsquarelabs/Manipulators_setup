@@ -391,7 +391,8 @@
     </collision>
     <inertial>
       <origin rpy="0 0 0" xyz="0.0 2.274e-05 0.03232288"/>
-      <mass value="5.14e-01"/>  <!-- corrected: measured 772g total vs CAD 921g -->
+      <mass value="0.514"/>  <!-- corrected: measured 772g total vs CAD 921g -->
+      <!-- <mass value="0.514"/>   -->
       <inertia ixx="5.1617816e-04" ixy="2.936e-8" ixz="0.0" iyy="5.8802208e-04" iyz="-3.2296e-7" izz="3.9462776e-04"/>
     </inertial>
   </link>
