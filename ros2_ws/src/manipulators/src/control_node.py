@@ -27,6 +27,7 @@ from rcl_interfaces.msg import ParameterDescriptor
 from .hardware import KinovaHardware
 from .robot_model import RobotModel
 from .diff_ik_controller import DiffIKController
+from .osc_controller import OSCController
 from .utility import kinova_degrees_to_radians, matrix_to_quat
 
 
@@ -34,7 +35,7 @@ class ControlNode(Node):
     def __init__(self):
         super().__init__('control_node')
 
-        # -- Parameters --
+        # -- Shared parameters --
         self.declare_parameter('robot_ip', '192.168.1.10')
         self.declare_parameter('username', 'admin')
         self.declare_parameter('password', 'admin')
@@ -43,14 +44,23 @@ class ControlNode(Node):
         self.declare_parameter('home_position_deg', [0.0, 344.0, 180.0, 214.0, 0.0, 315.0, 90.0])
         self.declare_parameter('initial_pose', 'home')
         self.declare_parameter('control_rate_hz', 400.0)
+        self.declare_parameter('max_torque', [30.0, 30.0, 30.0, 30.0, 7.0, 7.0, 7.0])
+        self.declare_parameter('controller_type', 'diff_ik')
+
+        # -- Controller gains (shared names, values set per controller config) --
         self.declare_parameter('kp_task', [150.0, 150.0, 150.0, 80.0, 80.0, 80.0])
         self.declare_parameter('kp_joint', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.declare_parameter('kd_joint', [12.0, 12.0, 12.0, 12.0, 4.0, 4.0, 4.0])
+
+        # -- Diff-IK only --
         self.declare_parameter('damping', 0.01)
         self.declare_parameter('max_joint_velocity', 1.5)
-        self.declare_parameter('max_torque', [30.0, 30.0, 30.0, 30.0, 7.0, 7.0, 7.0])
 
-        # Read params
+        # -- OSC only --
+        self.declare_parameter('kd_task', [50.0, 50.0, 50.0, 30.0, 30.0, 30.0])
+        self.declare_parameter('max_wrench', [100.0, 100.0, 100.0, 30.0, 30.0, 30.0])
+
+        # Read shared params
         self.robot_ip = self.get_parameter('robot_ip').value
         self.username = self.get_parameter('username').value
         self.password = self.get_parameter('password').value
@@ -60,12 +70,8 @@ class ControlNode(Node):
             self.get_parameter('initial_pose').value
         )
         self.rate_hz = self.get_parameter('control_rate_hz').value
-        self.kp_task = np.array(self.get_parameter('kp_task').value)
-        self.kp_joint = np.array(self.get_parameter('kp_joint').value)
-        self.kd_joint = np.array(self.get_parameter('kd_joint').value)
-        self.damping = self.get_parameter('damping').value
-        self.max_dq = self.get_parameter('max_joint_velocity').value
         self.max_torque = np.array(self.get_parameter('max_torque').value)
+        self.controller_type = self.get_parameter('controller_type').value
 
         # Resolve URDF path
         urdf_file = self.get_parameter('urdf_file').value
@@ -175,16 +181,30 @@ class ControlNode(Node):
             self._target_quat = ee_quat
 
         # Create controller
-        self.controller = DiffIKController(
-            model=self.model,
-            kp_task=self.kp_task,
-            kp_joint=self.kp_joint,
-            kd_joint=self.kd_joint,
-            dt=1.0 / self.rate_hz,
-            damping=self.damping,
-            max_joint_velocity=self.max_dq,
-            max_torque=self.max_torque,
-        )
+        if self.controller_type == 'osc':
+            q_ref = kinova_degrees_to_radians(np.array(self.home_deg))
+            self.controller = OSCController(
+                model=self.model,
+                kp_task=np.array(self.get_parameter('kp_task').value),
+                kd_task=np.array(self.get_parameter('kd_task').value),
+                kp_null=np.array(self.get_parameter('kp_joint').value),
+                kd_null=np.array(self.get_parameter('kd_joint').value),
+                q_ref=q_ref,
+                max_joint_torque=self.max_torque,
+                max_wrench=np.array(self.get_parameter('max_wrench').value),
+            )
+        else:
+            self.controller = DiffIKController(
+                model=self.model,
+                kp_task=np.array(self.get_parameter('kp_task').value),
+                kp_joint=np.array(self.get_parameter('kp_joint').value),
+                kd_joint=np.array(self.get_parameter('kd_joint').value),
+                dt=1.0 / self.rate_hz,
+                damping=self.get_parameter('damping').value,
+                max_joint_velocity=self.get_parameter('max_joint_velocity').value,
+                max_torque=self.max_torque,
+            )
+        self.get_logger().info(f"Controller: {self.controller_type}")
 
         # Switch to low-level torque mode
         self.get_logger().info("Entering torque mode ...")
