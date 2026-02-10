@@ -68,6 +68,14 @@ class RobotModel:
         )
         return J_full[:, self._v_idx]
 
+    def mass_matrix(self, q: np.ndarray) -> np.ndarray:
+        """Compute joint-space mass matrix M(q) (7x7)."""
+        self._set_q(q)
+        pin.crba(self.model, self.data, self._q_full)
+        M = self.data.M.copy()
+        M = np.triu(M) + np.triu(M, 1).T  # crba only fills upper triangle, not needed even without this its correct but just to be safe we symmetrize it
+        return M[np.ix_(self._v_idx, self._v_idx)]
+
     def fk(self, q: np.ndarray):
         """Forward kinematics. Returns (position (3,), rotation (3,3))."""
         self._set_q(q)
