@@ -1,27 +1,31 @@
 """
 Differential IK controller with gravity compensation.
 
-Target EE pose  -->  diff-IK (damped pseudoinverse)  -->  desired joint velocities
-                -->  joint-space damping + gravity comp  -->  joint torques
+Supports two modes:
+  - 'pose': tracks a target pose (position + orientation)
+  - 'velocity': tracks a target twist (linear + angular velocity)
+
+Pose mode:
+  Target EE pose --> pose error --> desired twist --> diff-IK --> dq_desired --> torques
+
+Velocity mode:
+  Target twist --> diff-IK --> dq_desired --> torques
 """
 
 import numpy as np
 
-from .robot_model import RobotModel
-from .utility import pose_error
+from ..robot_model import RobotModel
+from ..utility import pose_error
+from .base import BaseController
 
 
-class DiffIKController:
+class DiffIKController(BaseController):
     """
-    Computes joint torques to track a Cartesian pose target.
+    Computes joint torques to track a Cartesian target.
 
-    Each cycle:
-      1. FK to get current EE pose
-      2. Compute 6D pose error (position + orientation)
-      3. Desired EE twist = Kp_task * error
-      4. Desired joint velocity = J_damped_pinv * twist
-      5. q_desired = q + dq_desired * dt
-      6. Torque = Kp_joint * (q_desired - q) + Kd_joint * (dq_desired - dq_actual) + gravity(q)
+    Modes:
+      - 'pose': target = (pos, quat) -> Kp * pose_error -> desired twist
+      - 'velocity': target = twist -> use directly as desired twist
     """
 
     def __init__(
@@ -34,8 +38,9 @@ class DiffIKController:
         damping: float = 0.01,
         max_joint_velocity: float = 1.5,
         max_torque: np.ndarray = None,
+        mode: str = 'pose',
     ):
-        self.model = model
+        super().__init__(model, mode)
         self.kp_task = np.asarray(kp_task, dtype=float)       # (6,)
         self.kp_joint = np.asarray(kp_joint, dtype=float)     # (7,)
         self.kd_joint = np.asarray(kd_joint, dtype=float)     # (7,)
@@ -47,33 +52,46 @@ class DiffIKController:
             else np.full(7, 50.0)
         )
 
+        # Bind twist computation method at init (no branching in control loop)
+        if mode == 'pose':
+            self._compute_twist = self._twist_from_pose
+        elif mode == 'velocity':
+            self._compute_twist = self._twist_from_velocity
+        else:
+            raise ValueError(f"Unknown mode: {mode}. Use 'pose' or 'velocity'.")
+
+    def _twist_from_pose(self, target: tuple, q: np.ndarray) -> np.ndarray:
+        """Compute desired twist from pose error."""
+        target_pos, target_quat = target
+        ee_pos, ee_rot = self.model.fk(q)
+        error = pose_error(target_pos, target_quat, ee_pos, ee_rot)
+        return self.kp_task * error
+
+    def _twist_from_velocity(self, target: np.ndarray, q: np.ndarray) -> np.ndarray:
+        """Use target twist directly."""
+        return np.asarray(target, dtype=float)
+
     def compute(
         self,
-        target_pos: np.ndarray,
-        target_quat_xyzw: np.ndarray,
+        target,
         q: np.ndarray,
         dq: np.ndarray,
     ) -> np.ndarray:
         """
-        Compute joint torques to track the target pose.
+        Compute joint torques to track the target.
 
         Args:
-            target_pos: desired EE position (3,)
-            target_quat_xyzw: desired EE orientation [x,y,z,w] (4,)
+            target: depends on mode:
+                - 'pose': (target_pos (3,), target_quat_xyzw (4,))
+                - 'velocity': target_twist (6,)
             q: current joint positions in radians (7,)
             dq: current joint velocities in rad/s (7,)
 
         Returns:
             torques: (7,) joint torques in Nm
         """
-        # Current EE pose
-        ee_pos, ee_rot = self.model.fk(q)
-
-        # 6D pose error
-        error = pose_error(target_pos, target_quat_xyzw, ee_pos, ee_rot)
-
-        # Desired EE twist (task-space proportional control)
-        twist_desired = self.kp_task * error  # (6,)
+        # Desired twist (method selected at init)
+        twist_desired = self._compute_twist(target, q)
 
         # Jacobian and damped pseudoinverse
         J = self.model.jacobian(q)  # (6, 7)
@@ -89,7 +107,7 @@ class DiffIKController:
         q_desired = q + dq_desired * self.dt
 
         # Joint torques: PD tracking + gravity compensation
-        dq_desired*=0.0
+        dq_desired *= 0.0
         # self.kp_joint*=0.0
         tau = (self.kp_joint * (q_desired - q)
                + self.kd_joint * (dq_desired - dq)
@@ -99,3 +117,4 @@ class DiffIKController:
         tau = np.clip(tau, -self.max_torque, self.max_torque)
 
         return tau
+

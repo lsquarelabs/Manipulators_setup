@@ -41,10 +41,12 @@ DEFAULT_CORRECTIONS = os.path.join(
 ARM_JOINT_NAMES = [f"gen3_joint_{i}" for i in range(1, 8)]
 PARAMS_PER_BODY = 10
 HOME_DEG = np.array([0.0, 30.0, 0.0, 90.0, 0.0, 60.0, -90.0])
+# HOME_DEG = np.array([0.0, 90.0, 0.0, 90.0, 0.0, 00.0, -90.0])
 RATE_HZ = 1000
-KD = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 50.0, 0.0])  # Damping gains per joint (Nm/(rad/s))
-FC = np.array([0.7, 0.7, 0.0, 0.0, 0.0, 0.0, 0.0])  # Coulomb friction per joint (Nm)
-FV = np.array([4.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # Viscous friction per joint (Nm/(rad/s))
+KP = np.array([0.0]*7)  # Position gains per joint (Nm/rad)
+KD = np.array([60.0, 60.0, 60.0, 60.0, 0.0, 0.0, 0.0])  # Damping gains per joint (Nm/(rad/s))
+FC = np.array([0.0, 0.0, 0.0, 0.0, 0.1, 0.1, 0.3])  # Coulomb friction per joint (Nm)
+FV = np.array([0.0, 0.0, 0.0, 0.0, 2.0, 2.0, 4.0])  # Viscous friction per joint (Nm/(rad/s))
 
 
 def load_pin_model(urdf_path):
@@ -173,11 +175,12 @@ def main():
         time.sleep(0.5)
         hw.set_torque_mode(enabled=True)
 
-        print(f"Running gravity compensation at {args.rate} Hz with damping. Press Ctrl+C to stop.")
+        print(f"Running gravity compensation at {args.rate} Hz with Kp + Kd. Press Ctrl+C to stop.")
         print("-" * 60)
 
         loop_count = 0
         t_start = time.time()
+        q_home_rad = kinova_deg_to_rad(HOME_DEG)
 
         while running:
             t_loop = time.time()
@@ -190,14 +193,21 @@ def main():
             g_torques = compute_gravity_torques(
                 model, pin_data, v_idx, q_info, q_rad)
 
+            # Position error (wrap to [-pi, pi])
+            q_err = q_home_rad - q_rad
+            q_err = (q_err + np.pi) % (2 * np.pi) - np.pi
+
+            # Add position torques (pull towards home)
+            position_torques = KP * q_err
+
             # Add damping torques
             damping_torques = -KD * vel_rad
 
             # Add friction compensation (Coulomb + viscous)
             friction_torques = FC * np.sign(vel_rad) + FV * vel_rad
 
-            total_torques = g_torques + damping_torques + friction_torques
-
+            total_torques = g_torques + position_torques + damping_torques + friction_torques
+            total_torques[5] += 2.0
             # Send torques
             state = hw.send_torques(
                 torques=total_torques,
@@ -205,16 +215,16 @@ def main():
             )
             positions_deg = state.positions_deg.copy()
             velocities_deg = state.velocities_deg.copy()
+            read_torques = state.torques.copy()
 
             loop_count += 1
-            if loop_count % (args.rate * 2) == 0:
+            if loop_count % 10 == 0 or loop_count == 1:
                 elapsed = time.time() - t_start
                 actual_rate = loop_count / elapsed
                 q_signed = positions_deg.copy()
                 q_signed[q_signed > 180.0] -= 360.0
-                print(f"  rate={actual_rate:.0f}Hz  "
-                      f"tau=[{', '.join(f'{t:+.2f}' for t in total_torques)}]  "
-                      f"q=[{', '.join(f'{q:.1f}' for q in q_signed)}]")
+                q_err_deg = np.rad2deg(q_err)
+                print(f"  rate={actual_rate:.0f}Hz \n g_t=[{', '.join(f'{t:+.2f}' for t in g_torques)}] \n p_t=[{', '.join(f'{t:+.2f}' for t in position_torques)}] \n t_t=[{', '.join(f'{t:+.2f}' for t in total_torques)}] \n r_t=[{', '.join(f'{t:+.2f}' for t in read_torques)}] \n q=[{', '.join(f'{q:.1f}' for q in q_signed)}] \n err=[{', '.join(f'{e:.1f}' for e in q_err_deg)}]deg \n\n")
 
             # Rate limiting
             dt_elapsed = time.time() - t_loop

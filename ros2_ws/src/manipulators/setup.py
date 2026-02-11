@@ -26,13 +26,14 @@ data_files += collect_data_files('assets')
 setup(
     name=package_name,
     version='0.1.0',
-    packages=['src', 'src.detectors', 'scripts'],
+    packages=['src', 'src.controllers', 'src.detectors', 'scripts'],
     data_files=data_files,
     install_requires=['setuptools'],
     zip_safe=True,
     entry_points={
         'console_scripts': [
             'control_node = src.control_node:main',
+            'mujoco_sim = src.mujoco_sim:main',
             'keyboard_teleop = src.keyboard_teleop:main',
             'object_detection_node = src.object_detection_node:main',
             'pick_place_policy = src.pick_place_policy:main',

@@ -27,7 +27,9 @@
       "Bash(xargs:*)",
       "Bash(wc:*)",
       "Bash(conda list:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(git branch:*)",
+      "Bash(git push:*)"
     ],
     "deny": [],
     "ask": []

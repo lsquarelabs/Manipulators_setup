@@ -1,24 +1,24 @@
-"""Launch control node with OSC controller and keyboard teleop."""
+"""
+Launch control node + keyboard teleop in simulation mode.
+
+Start the MuJoCo sim server first in a separate terminal:
+    ros2 run manipulators mujoco_sim
+
+Then launch this:
+    ros2 launch manipulators sim_diff_ik.launch.py
+"""
 
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
     pkg_share = get_package_share_directory('manipulators')
-    config_file = os.path.join(pkg_share, 'config', 'osc_teleop.yaml')
+    config_file = os.path.join(pkg_share, 'config', 'diff_ik_teleop.yaml')
 
     return LaunchDescription([
-        DeclareLaunchArgument(
-            'robot_ip',
-            default_value='192.168.1.10',
-            description='Kinova robot IP address',
-        ),
-
         Node(
             package='manipulators',
             executable='control_node',
@@ -26,7 +26,10 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 config_file,
-                {'robot_ip': LaunchConfiguration('robot_ip')},
+                {
+                    'use_sim': True,
+                    'robot_ip': '127.0.0.1',
+                },
             ],
         ),
 
@@ -39,4 +42,3 @@ def generate_launch_description():
             parameters=[config_file],
         ),
     ])
-

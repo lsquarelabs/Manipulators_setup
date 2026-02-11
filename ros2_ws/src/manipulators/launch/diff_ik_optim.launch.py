@@ -1,4 +1,4 @@
-"""Launch control node with OSC controller and keyboard teleop."""
+"""Launch control node with QP-based diff-IK controller and keyboard teleop."""
 
 import os
 from launch import LaunchDescription
@@ -10,7 +10,7 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
     pkg_share = get_package_share_directory('manipulators')
-    config_file = os.path.join(pkg_share, 'config', 'osc_teleop.yaml')
+    config_file = os.path.join(pkg_share, 'config', 'diff_ik_optim_teleop.yaml')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -39,4 +39,3 @@ def generate_launch_description():
             parameters=[config_file],
         ),
     ])
-

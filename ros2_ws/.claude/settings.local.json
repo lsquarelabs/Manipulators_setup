@@ -12,7 +12,13 @@
       "Bash(sudo udevadm control:*)",
       "Bash(sudo udevadm trigger:*)",
       "Bash(chmod:*)",
-      "Bash(ros2 pkg executables:*)"
+      "Bash(ros2 pkg executables:*)",
+      "Bash(python -c:*)",
+      "Bash(python3:*)",
+      "Bash(timeout 3 ros2 run:*)",
+      "Bash(timeout 2 ros2 run:*)",
+      "Bash(echo:*)",
+      "Bash(PYTHONUNBUFFERED=1 timeout 2 ros2 run:*)"
     ]
   }
 }

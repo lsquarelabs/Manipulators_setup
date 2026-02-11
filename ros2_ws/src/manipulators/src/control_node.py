@@ -17,7 +17,7 @@ import rclpy
 logging.getLogger('manipulators.hardware').setLevel(logging.DEBUG)
 logging.basicConfig(level=logging.INFO, format='[%(name)s] %(levelname)s: %(message)s')
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TwistStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64
 from std_srvs.srv import Trigger
@@ -26,8 +26,7 @@ from rcl_interfaces.msg import ParameterDescriptor
 
 from .hardware import KinovaHardware
 from .robot_model import RobotModel
-from .diff_ik_controller import DiffIKController
-from .osc_controller import OSCController
+from .controllers import create_controller
 from .utility import kinova_degrees_to_radians, matrix_to_quat
 
 
@@ -36,6 +35,7 @@ class ControlNode(Node):
         super().__init__('control_node')
 
         # -- Shared parameters --
+        self.declare_parameter('use_sim', False)
         self.declare_parameter('robot_ip', '192.168.1.10')
         self.declare_parameter('username', 'admin')
         self.declare_parameter('password', 'admin')
@@ -46,6 +46,7 @@ class ControlNode(Node):
         self.declare_parameter('control_rate_hz', 400.0)
         self.declare_parameter('max_torque', [30.0, 30.0, 30.0, 30.0, 7.0, 7.0, 7.0])
         self.declare_parameter('controller_type', 'diff_ik')
+        self.declare_parameter('controller_mode', 'pose')  # 'pose' or 'velocity'
 
         # -- Controller gains (shared names, values set per controller config) --
         self.declare_parameter('kp_task', [150.0, 150.0, 150.0, 80.0, 80.0, 80.0])
@@ -56,11 +57,19 @@ class ControlNode(Node):
         self.declare_parameter('damping', 0.01)
         self.declare_parameter('max_joint_velocity', 1.5)
 
+        # -- Diff-IK-Optim only --
+        self.declare_parameter('task_weight', 1.0)
+        self.declare_parameter('posture_weight', 0.001)
+        self.declare_parameter('velocity_limit_scale', 1.0)
+        self.declare_parameter('config_limit_gain', 0.5)
+        self.declare_parameter('solver', 'osqp')
+
         # -- OSC only --
         self.declare_parameter('kd_task', [50.0, 50.0, 50.0, 30.0, 30.0, 30.0])
         self.declare_parameter('max_wrench', [100.0, 100.0, 100.0, 30.0, 30.0, 30.0])
 
         # Read shared params
+        self.use_sim = self.get_parameter('use_sim').value
         self.robot_ip = self.get_parameter('robot_ip').value
         self.username = self.get_parameter('username').value
         self.password = self.get_parameter('password').value
@@ -72,6 +81,7 @@ class ControlNode(Node):
         self.rate_hz = self.get_parameter('control_rate_hz').value
         self.max_torque = np.array(self.get_parameter('max_torque').value)
         self.controller_type = self.get_parameter('controller_type').value
+        self.controller_mode = self.get_parameter('controller_mode').value
 
         # Resolve URDF path
         urdf_file = self.get_parameter('urdf_file').value
@@ -82,10 +92,13 @@ class ControlNode(Node):
 
         # -- Publishers --
         self.joint_state_pub = self.create_publisher(JointState, 'joint_states', 10)
-        self.ee_pose_pub = self.create_publisher(PoseStamped, 'ee_pose', 10)
+        self.ee_state_pub = self.create_publisher(PoseStamped, 'ee_state', 10)
 
-        # -- Subscribers --
-        self.create_subscription(PoseStamped, 'target_pose', self._on_target_pose, 1)
+        # -- Subscribers (target topic based on mode) --
+        if self.controller_mode == 'pose':
+            self.create_subscription(PoseStamped, 'ee_target_pose', self._on_target_pose, 1)
+        else:
+            self.create_subscription(TwistStamped, 'ee_target_twist', self._on_target_twist, 1)
         self.create_subscription(Float64, 'gripper_command', self._on_gripper_command, 1)
 
         # -- Services --
@@ -93,8 +106,7 @@ class ControlNode(Node):
 
         # -- Shared state (written by callbacks, read by control thread) --
         self._lock = threading.Lock()
-        self._target_pos = None       # (3,)  set after startup FK
-        self._target_quat = None      # (4,)  xyzw
+        self._target = None           # pose: (pos, quat) | velocity: twist (6,)
         self._gripper_target = 0.0    # 0.0=open, 1.0=closed
 
         # -- Control thread --
@@ -138,8 +150,13 @@ class ControlNode(Node):
 
     def startup(self):
         """Full startup: connect → home → torque mode → start loop."""
-        self.get_logger().info(f"Connecting to robot at {self.robot_ip} ...")
-        self.hw = KinovaHardware(self.robot_ip, self.username, self.password)
+        if self.use_sim:
+            from .mujoco_hardware import MujocoHardware
+            self.get_logger().info(f"Connecting to sim at {self.robot_ip} ...")
+            self.hw = MujocoHardware(self.robot_ip)
+        else:
+            self.get_logger().info(f"Connecting to robot at {self.robot_ip} ...")
+            self.hw = KinovaHardware(self.robot_ip, self.username, self.password)
         self.hw.connect()
         self.get_logger().info("Connected.")
 
@@ -177,34 +194,48 @@ class ControlNode(Node):
         quat_norm = np.linalg.norm(ee_quat)
         self.get_logger().info(f"Home EE pose: pos={ee_pos.round(4)}, quat={ee_quat.round(4)}, quat_norm={quat_norm:.4f}")
         with self._lock:
-            self._target_pos = ee_pos.copy()
-            self._target_quat = ee_quat
+            if self.controller_mode == 'pose':
+                self._target = (ee_pos.copy(), ee_quat.copy())
+            else:
+                self._target = np.zeros(6)  # zero twist initially
 
-        # Create controller
+        # Create controller via factory
+        controller_kwargs = {
+            'kp_task': np.array(self.get_parameter('kp_task').value),
+            'kp_joint': np.array(self.get_parameter('kp_joint').value),
+            'kd_joint': np.array(self.get_parameter('kd_joint').value),
+            'max_torque': self.max_torque,
+        }
         if self.controller_type == 'osc':
-            q_ref = kinova_degrees_to_radians(np.array(self.home_deg))
-            self.controller = OSCController(
-                model=self.model,
-                kp_task=np.array(self.get_parameter('kp_task').value),
-                kd_task=np.array(self.get_parameter('kd_task').value),
-                kp_null=np.array(self.get_parameter('kp_joint').value),
-                kd_null=np.array(self.get_parameter('kd_joint').value),
-                q_ref=q_ref,
-                max_joint_torque=self.max_torque,
-                max_wrench=np.array(self.get_parameter('max_wrench').value),
-            )
+            controller_kwargs.update({
+                'kd_task': np.array(self.get_parameter('kd_task').value),
+                'kp_null': controller_kwargs.pop('kp_joint'),
+                'kd_null': controller_kwargs.pop('kd_joint'),
+                'q_ref': kinova_degrees_to_radians(np.array(self.home_deg)),
+                'max_joint_torque': controller_kwargs.pop('max_torque'),
+                'max_wrench': np.array(self.get_parameter('max_wrench').value),
+            })
+        elif self.controller_type == 'diff_ik_optim':
+            controller_kwargs.update({
+                'dt': 1.0 / self.rate_hz,
+                'task_weight': self.get_parameter('task_weight').value,
+                'posture_weight': self.get_parameter('posture_weight').value,
+                'damping': self.get_parameter('damping').value,
+                'velocity_limit_scale': self.get_parameter('velocity_limit_scale').value,
+                'q_ref': kinova_degrees_to_radians(np.array(self.home_deg)),
+                'config_limit_gain': self.get_parameter('config_limit_gain').value,
+                'solver': self.get_parameter('solver').value,
+            })
         else:
-            self.controller = DiffIKController(
-                model=self.model,
-                kp_task=np.array(self.get_parameter('kp_task').value),
-                kp_joint=np.array(self.get_parameter('kp_joint').value),
-                kd_joint=np.array(self.get_parameter('kd_joint').value),
-                dt=1.0 / self.rate_hz,
-                damping=self.get_parameter('damping').value,
-                max_joint_velocity=self.get_parameter('max_joint_velocity').value,
-                max_torque=self.max_torque,
-            )
-        self.get_logger().info(f"Controller: {self.controller_type}")
+            controller_kwargs.update({
+                'dt': 1.0 / self.rate_hz,
+                'damping': self.get_parameter('damping').value,
+                'max_joint_velocity': self.get_parameter('max_joint_velocity').value,
+            })
+        self.controller = create_controller(
+            self.controller_type, self.model, mode=self.controller_mode, **controller_kwargs
+        )
+        self.get_logger().info(f"Controller: {self.controller_type}, mode: {self.controller_mode}")
 
         # Switch to low-level torque mode
         self.get_logger().info("Entering torque mode ...")
@@ -270,12 +301,14 @@ class ControlNode(Node):
 
                 # Get current target
                 with self._lock:
-                    target_pos = self._target_pos.copy()
-                    target_quat = self._target_quat.copy()
+                    if self.controller_mode == 'pose':
+                        target = (self._target[0].copy(), self._target[1].copy())
+                    else:
+                        target = self._target.copy()
                     gripper = self._gripper_target
 
                 # Compute torques
-                torques = self.controller.compute(target_pos, target_quat, q, dq)
+                torques = self.controller.compute(target, q, dq)
 
                 # Send to robot and get fresh state for next cycle
                 state = self.hw.send_torques(torques, state.positions_deg, gripper)
@@ -321,25 +354,38 @@ class ControlNode(Node):
         ps.pose.orientation.y = float(ee_quat[1])
         ps.pose.orientation.z = float(ee_quat[2])
         ps.pose.orientation.w = float(ee_quat[3])
-        self.ee_pose_pub.publish(ps)
+        self.ee_state_pub.publish(ps)
 
     # ------------------------------------------------------------------
     # Callbacks
     # ------------------------------------------------------------------
 
     def _on_target_pose(self, msg: PoseStamped):
+        pos = np.array([
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+        ])
+        quat = np.array([
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z,
+            msg.pose.orientation.w,
+        ])
         with self._lock:
-            self._target_pos = np.array([
-                msg.pose.position.x,
-                msg.pose.position.y,
-                msg.pose.position.z,
-            ])
-            self._target_quat = np.array([
-                msg.pose.orientation.x,
-                msg.pose.orientation.y,
-                msg.pose.orientation.z,
-                msg.pose.orientation.w,
-            ])
+            self._target = (pos, quat)
+
+    def _on_target_twist(self, msg: TwistStamped):
+        twist = np.array([
+            msg.twist.linear.x,
+            msg.twist.linear.y,
+            msg.twist.linear.z,
+            msg.twist.angular.x,
+            msg.twist.angular.y,
+            msg.twist.angular.z,
+        ])
+        with self._lock:
+            self._target = twist
 
     def _on_gripper_command(self, msg: Float64):
         with self._lock:

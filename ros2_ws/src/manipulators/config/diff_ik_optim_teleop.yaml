@@ -1,0 +1,58 @@
+control_node:
+  ros__parameters:
+    # Robot connection
+    robot_ip: "192.168.1.10"
+    username: "admin"
+    password: "admin"
+
+    # URDF (relative to package share, or absolute path)
+    urdf_file: "assets/robots/kinova/urdf/gen3_2f85.urdf"
+    ee_frame: "gen3_end_effector_link"
+
+    # Home position (degrees) - Kinova 0-360 convention
+    home_position_deg: [0.0, 30.0, 0.0, 90.0, 0.0, 60.0, -90.0]
+
+    # Control loop
+    control_rate_hz: 400.0
+
+    # Safety limits
+    max_torque: [30.0, 30.0, 30.0, 30.0, 7.0, 7.0, 7.0]  # Nm per joint
+
+    # Named joint poses (degrees, Kinova 0-360 convention)
+    calib_pose_deg: [90.0, 30.0, 0.0, 90.0, 0.0, 60.0, -90.0]
+
+    # Controller
+    controller_type: "diff_ik_optim"
+    controller_mode: "pose"      # 'pose' or 'velocity'
+
+    # Task-space proportional gains [x, y, z, rx, ry, rz]
+    kp_task: [500.0, 500.0, 500.0, 1000.0, 1000.0, 1000.0]
+    kd_task: [00.0, 00.0, 000.0, 00.0, 00.0, 00.0]
+
+    # Joint-space position gains (per joint, 1-7)
+    kp_joint: [100.0, 100.0, 100.0, 100.0, 300.0, 300.0, 300.0]
+    # Joint-space damping gains (per joint, 1-7)
+    kd_joint: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    # QP task weight (overall importance of EE tracking cost)
+    task_weight: 1.0
+    # QP posture regularization weight (bounded joints only — pulls toward home)
+    posture_weight: 0.001
+    # Tikhonov damping for QP numerical stability
+    damping: 0.00000
+    # Multiplier on URDF velocity limits (>1 to allow faster motion)
+    velocity_limit_scale: 30.0
+    # Position limit constraint gain (0,1] — how aggressively to steer away from limits
+    config_limit_gain: 0.0
+    # QP solver backend
+    solver: "osqp"
+
+    # Joint velocity and position limits are read directly from the URDF.
+    # Continuous joints (1, 3, 5, 7) have no position limits or posture pull.
+    # Bounded joints (2, 4, 6) get position limit constraints and posture regularization.
+
+keyboard_teleop:
+  ros__parameters:
+    linear_step: 0.005            # meters per keypress
+    angular_step: 0.05            # radians per keypress
+    publish_rate: 30.0            # Hz
